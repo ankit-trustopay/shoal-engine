@@ -1,9 +1,10 @@
-"""Multi-tier live web data: SearxNG (primary) → Wikipedia API (fallback)."""
+"""Live web data: Tavily API (primary) → Wikipedia → graceful placeholder."""
 
 from __future__ import annotations
 
 import html
 import logging
+import os
 import re
 from typing import Any, TypedDict
 from urllib.parse import quote
@@ -12,21 +13,16 @@ import requests
 
 logger = logging.getLogger(__name__)
 
-SEARXNG_URLS = [
-    "https://searx.be/search",
-    "https://searx.tiekoetter.com/search",
-    "https://search.mdn.eu/search",
-]
-
-SEARXNG_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36"
-    ),
-}
+TAVILY_SEARCH_URL = "https://api.tavily.com/search"
+TAVILY_MAX_RESULTS = 3
 
 WIKIPEDIA_API_URL = "https://en.wikipedia.org/w/api.php"
-REQUEST_TIMEOUT_SECONDS = 3
+HTTP_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (compatible; ShoalAI-Engine/1.0; +https://shoal.ai)"
+    ),
+}
+REQUEST_TIMEOUT_SECONDS = 10
 MAX_SNIPPET_CHARS = 500
 MAX_EVIDENCE_ITEMS = 5
 
@@ -38,6 +34,11 @@ class EvidenceItem(TypedDict):
     source: str
     url: str
     snippet: str
+
+
+def _get_tavily_api_key() -> str | None:
+    key = os.getenv("TAVILY_API_KEY", "").strip()
+    return key or None
 
 
 def _clean_html(text: str) -> str:
@@ -66,82 +67,95 @@ def _format_context_from_evidence(items: list[EvidenceItem]) -> str:
     return "\n\n".join(chunks)
 
 
-def _fetch_searxng_evidence(query: str) -> list[EvidenceItem]:
-    """Tier 1: public SearxNG instances (structured evidence rows)."""
-    params = {"q": query, "format": "json"}
+def _map_tavily_results(results: list[Any]) -> list[EvidenceItem]:
     evidence: list[EvidenceItem] = []
 
-    for url in SEARXNG_URLS:
-        try:
-            response = requests.get(
-                url,
-                headers=SEARXNG_HEADERS,
-                params=params,
-                timeout=REQUEST_TIMEOUT_SECONDS,
-            )
-        except requests.Timeout as exc:
-            print(f"SearxNG timeout at {url}: {exc}")
-            logger.warning("SearxNG timeout at %s: %s", url, exc)
+    for result in results:
+        if not isinstance(result, dict):
             continue
-        except requests.RequestException as exc:
-            print(f"SearxNG request failed at {url}: {exc}")
-            logger.warning("SearxNG request failed at %s: %s", url, exc)
+        title = str(result.get("title") or "Untitled").strip()
+        snippet = _truncate_snippet(str(result.get("content") or "").strip())
+        page_url = str(result.get("url") or "").strip()
+        if not title or not snippet or not page_url:
             continue
+        evidence.append(
+            {
+                "title": title,
+                "source": "Web (Tavily)",
+                "url": page_url,
+                "snippet": snippet,
+            },
+        )
+        if len(evidence) >= TAVILY_MAX_RESULTS:
+            break
 
-        if response.status_code != 200:
-            print(
-                f"SearxNG non-200 at {url}: status={response.status_code}",
-            )
-            logger.warning(
-                "SearxNG non-200 at %s: status=%s",
-                url,
-                response.status_code,
-            )
-            continue
+    return evidence
 
-        try:
-            payload: dict[str, Any] = response.json()
-        except ValueError as exc:
-            print(f"SearxNG invalid JSON at {url}: {exc}")
-            logger.warning("SearxNG invalid JSON at %s: %s", url, exc)
-            continue
 
-        results = payload.get("results", [])
-        if not isinstance(results, list) or not results:
-            print(f"SearxNG returned no results at {url}")
-            continue
+def _fetch_tavily_evidence(query: str) -> list[EvidenceItem]:
+    """Tier 1: Tavily real-time search API."""
+    api_key = _get_tavily_api_key()
+    if not api_key:
+        logger.warning("TAVILY_API_KEY is not set; skipping Tavily search")
+        print("TAVILY_API_KEY missing; skipping Tavily tier")
+        return []
 
-        for result in results:
-            if not isinstance(result, dict):
-                continue
-            title = str(result.get("title") or "Untitled").strip()
-            snippet = _truncate_snippet(
-                str(result.get("content") or "").strip(),
-            )
-            page_url = str(result.get("url") or "").strip()
-            if not title or not snippet or not page_url:
-                continue
-            evidence.append(
-                {
-                    "title": title,
-                    "source": "Web",
-                    "url": page_url,
-                    "snippet": snippet,
-                },
-            )
-            if len(evidence) >= MAX_EVIDENCE_ITEMS:
-                break
+    payload = {
+        "api_key": api_key,
+        "query": query,
+        "search_depth": "basic",
+        "include_answer": False,
+        "max_results": TAVILY_MAX_RESULTS,
+    }
 
-        if evidence:
-            print(f"SearxNG succeeded at {url} ({len(evidence)} evidence items)")
-            logger.info("SearxNG success at %s for query '%s'", url, query[:80])
-            return evidence
+    try:
+        response = requests.post(
+            TAVILY_SEARCH_URL,
+            json=payload,
+            headers={"Content-Type": "application/json"},
+            timeout=REQUEST_TIMEOUT_SECONDS,
+        )
+    except requests.Timeout as exc:
+        logger.warning("Tavily request timed out: %s", exc)
+        print(f"Tavily timeout: {exc}")
+        return []
+    except requests.RequestException as exc:
+        logger.warning("Tavily request failed: %s", exc)
+        print(f"Tavily request failed: {exc}")
+        return []
 
-        print(f"SearxNG had unparseable results at {url}")
+    if response.status_code != 200:
+        body_preview = response.text[:300] if response.text else ""
+        logger.warning(
+            "Tavily non-200: status=%s body=%s",
+            response.status_code,
+            body_preview,
+        )
+        print(f"Tavily non-200: status={response.status_code}")
+        return []
 
-    print("SearxNG failed on all instances")
-    logger.error("All SearxNG instances failed for query '%s'", query[:80])
-    return []
+    try:
+        data: dict[str, Any] = response.json()
+    except ValueError as exc:
+        logger.warning("Tavily invalid JSON: %s", exc)
+        print(f"Tavily invalid JSON: {exc}")
+        return []
+
+    results = data.get("results", [])
+    if not isinstance(results, list) or not results:
+        logger.info("Tavily returned no results for query '%s'", query[:80])
+        print("Tavily returned no results")
+        return []
+
+    evidence = _map_tavily_results(results)
+    if evidence:
+        logger.info(
+            "Tavily success for query '%s' (%s items)",
+            query[:80],
+            len(evidence),
+        )
+        print(f"Tavily succeeded ({len(evidence)} evidence items)")
+    return evidence
 
 
 def _fetch_wikipedia_evidence(query: str) -> list[EvidenceItem]:
@@ -158,7 +172,7 @@ def _fetch_wikipedia_evidence(query: str) -> list[EvidenceItem]:
     try:
         response = requests.get(
             WIKIPEDIA_API_URL,
-            headers=SEARXNG_HEADERS,
+            headers=HTTP_HEADERS,
             params=params,
             timeout=REQUEST_TIMEOUT_SECONDS,
         )
@@ -211,9 +225,10 @@ def _fetch_wikipedia_evidence(query: str) -> list[EvidenceItem]:
 
 
 def _fallback_evidence(query: str) -> list[EvidenceItem]:
+    """Tier 3: graceful placeholder so agents can still deliberate."""
     message = (
         f"Limited live data for '{query}'. "
-        "No SearxNG or Wikipedia results were retrieved; agents should "
+        "Tavily and Wikipedia did not return usable results; agents should "
         "reason carefully from the user premise and general knowledge."
     )
     return [
@@ -229,7 +244,7 @@ def _fallback_evidence(query: str) -> list[EvidenceItem]:
 def scrape_for_premise(query: str) -> tuple[str, list[EvidenceItem]]:
     """
     Fetch live context and structured evidence for a premise.
-    Tier 1: SearxNG → Tier 2: Wikipedia → minimal placeholder.
+    Tier 1: Tavily → Tier 2: Wikipedia → minimal placeholder.
     """
     trimmed = query.strip()
     if not trimmed:
@@ -238,17 +253,17 @@ def scrape_for_premise(query: str) -> tuple[str, list[EvidenceItem]]:
         return UNAVAILABLE_MESSAGE, []
 
     print(f"scrape_for_premise starting for query: {trimmed[:120]}")
-    logger.info("Starting multi-tier search for: %s", trimmed[:120])
+    logger.info("Starting Tavily-first search for: %s", trimmed[:120])
 
     try:
-        searx_evidence = _fetch_searxng_evidence(trimmed)
-        if searx_evidence:
-            return _format_context_from_evidence(searx_evidence), searx_evidence
+        tavily_evidence = _fetch_tavily_evidence(trimmed)
+        if tavily_evidence:
+            return _format_context_from_evidence(tavily_evidence), tavily_evidence
     except Exception as exc:
-        print(f"SearxNG tier raised unexpected error: {exc}")
-        logger.exception("SearxNG tier unexpected error")
+        print(f"Tavily tier raised unexpected error: {exc}")
+        logger.exception("Tavily tier unexpected error")
 
-    print("SearxNG failed, falling back to Wikipedia...")
+    print("Tavily unavailable or failed, falling back to Wikipedia...")
     try:
         wiki_evidence = _fetch_wikipedia_evidence(trimmed)
         if wiki_evidence:
@@ -257,7 +272,7 @@ def scrape_for_premise(query: str) -> tuple[str, list[EvidenceItem]]:
         print(f"Wikipedia tier raised unexpected error: {exc}")
         logger.exception("Wikipedia tier unexpected error")
 
-    print("Wikipedia failed; returning minimal fallback context")
+    print("All search tiers failed; returning graceful fallback context")
     logger.error("All scraper tiers failed for query '%s'", trimmed[:80])
     fallback = _fallback_evidence(trimmed)
     return _format_context_from_evidence(fallback), fallback
