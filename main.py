@@ -2,6 +2,7 @@ import asyncio
 import os
 
 from dotenv import load_dotenv
+from duckduckgo_search import DDGS
 from fastapi import FastAPI, HTTPException
 from openai import AsyncOpenAI
 from pydantic import BaseModel, Field
@@ -13,30 +14,36 @@ app = FastAPI(title="Shoal AI Engine", version="0.1.0")
 MODEL = "deepseek/deepseek-chat"
 
 MANAGER_SYSTEM = (
-    "You are the Manager. Read these 5 agent perspectives and provide a "
-    "final 2-sentence definitive verdict."
+    "You are the Manager. Read the live web data and the 5 human agent "
+    "perspectives, then provide a final 2-sentence definitive, data-backed "
+    "consensus."
 )
 
 PERSONAS: list[tuple[str, str]] = [
     (
-        "Financial Skeptic",
-        "Challenge the financial viability of the premise in 2 sentences.",
+        "Budget-Conscious Buyer",
+        "You are a highly frugal consumer. Focus strictly on price, "
+        "maintenance costs, and ROI using the web data.",
     ),
     (
-        "Domain Expert",
-        "Provide technical/historical facts about the premise in 2 sentences.",
+        "Performance Enthusiast",
+        "You care only about specs, speed, tech, and premium features. "
+        "Argue for the highest quality option using the web data.",
     ),
     (
-        "Risk Analyst",
-        "Identify the biggest tail-risk or downside of the premise in 2 sentences.",
+        "Safety & Practicality Parent",
+        "You are risk-averse. Focus on safety ratings, reliability, and "
+        "everyday usability using the web data.",
     ),
     (
-        "Consumer Voice",
-        "Explain how average people or end-users will react to this in 2 sentences.",
+        "Brand Status Fanboy",
+        "You care about luxury, brand perception, and social status. "
+        "Argue based on prestige using the web data.",
     ),
     (
-        "Optimist",
-        "Highlight the massive upside and bullish case for this premise in 2 sentences.",
+        "Skeptical Mechanic",
+        "You are a cynical expert. Look for flaws, recalls, or hidden issues "
+        "in the web data to warn the user.",
     ),
 ]
 
@@ -70,12 +77,45 @@ def get_client() -> AsyncOpenAI:
     )
 
 
+def search_web(query: str) -> str:
+    """Scrape top 3 live web results for the premise."""
+    try:
+        results = DDGS().text(query, max_results=3)
+    except Exception as exc:
+        print(f"[search_web] DuckDuckGo error: {exc}")
+        return "No live web data available."
+
+    if not results:
+        return "No live web results found for this query."
+
+    chunks: list[str] = []
+    for index, result in enumerate(results, start=1):
+        title = result.get("title", "Untitled")
+        body = result.get("body", "")
+        href = result.get("href", "")
+        chunks.append(
+            f"[{index}] {title}\n{body}\nSource: {href}".strip(),
+        )
+
+    combined = "\n\n".join(chunks)
+    print(f"[search_web] Retrieved {len(results)} results for: {query[:80]}")
+    return combined
+
+
 async def get_agent_response(
     client: AsyncOpenAI,
     role_name: str,
-    system_prompt: str,
+    persona_instruction: str,
     user_message: str,
+    web_data: str,
 ) -> dict[str, str]:
+    system_prompt = (
+        f"You are a {role_name}. {persona_instruction}\n\n"
+        f"Here is the live web data: {web_data}. "
+        "Use this real-world data to form your argument. "
+        "Respond in exactly 2 sentences."
+    )
+
     try:
         completion = await client.chat.completions.create(
             model=MODEL,
@@ -111,12 +151,16 @@ async def ignite(payload: IgniteRequest) -> IgniteResponse:
         f"[ignite] Starting parallel orchestration for swarm {payload.swarmId}",
     )
 
+    web_data = await asyncio.to_thread(search_web, premise)
+    print(f"[ignite] Web data preview:\n{web_data[:500]}...\n")
+
     agent_tasks = [
         get_agent_response(
             client,
             role_name,
-            f"You are a {role_name}. {instruction}",
+            instruction,
             premise,
+            web_data,
         )
         for role_name, instruction in PERSONAS
     ]
@@ -128,7 +172,8 @@ async def ignite(payload: IgniteRequest) -> IgniteResponse:
     )
     manager_user = (
         f"User premise:\n{premise}\n\n"
-        f"Agent perspectives:\n{combined_perspectives}"
+        f"Live web data:\n{web_data}\n\n"
+        f"Human agent perspectives:\n{combined_perspectives}"
     )
 
     manager_result = await get_agent_response(
@@ -136,6 +181,7 @@ async def ignite(payload: IgniteRequest) -> IgniteResponse:
         "Manager",
         MANAGER_SYSTEM,
         manager_user,
+        web_data,
     )
 
     messages = [
