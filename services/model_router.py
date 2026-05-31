@@ -13,6 +13,11 @@ DEFAULT_OPENROUTER_MODEL = os.getenv(
     "deepseek/deepseek-chat",
 )
 
+FALLBACK_OPENROUTER_MODEL = os.getenv(
+    "OPENROUTER_FALLBACK_MODEL",
+    "openai/gpt-4o-mini",
+)
+
 # OpenRouter slugs for requested UI models
 OPENROUTER_MODEL_MAP: dict[str, str] = {
     "gpt-4o": "openai/gpt-4o",
@@ -60,3 +65,11 @@ def resolve_openrouter_model(requested: str | None) -> str:
         DEFAULT_OPENROUTER_MODEL,
     )
     return DEFAULT_OPENROUTER_MODEL
+
+
+def get_fallback_openrouter_model(primary: str | None = None) -> str:
+    """Production fallback when the requested OpenRouter model is unavailable."""
+    resolved_primary = resolve_openrouter_model(primary)
+    if resolved_primary == FALLBACK_OPENROUTER_MODEL:
+        return DEFAULT_OPENROUTER_MODEL
+    return FALLBACK_OPENROUTER_MODEL

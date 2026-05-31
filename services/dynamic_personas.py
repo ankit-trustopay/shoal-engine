@@ -10,7 +10,7 @@ from typing import Any, Literal, TypedDict
 from fastapi import HTTPException
 from openai import AsyncOpenAI
 
-from services.model_router import DEFAULT_OPENROUTER_MODEL, resolve_openrouter_model
+from services.llm import chat_completion_with_fallback
 
 logger = logging.getLogger(__name__)
 
@@ -293,24 +293,17 @@ async def generate_dynamic_personas(
     trimmed = premise.strip()
     count = clamp_agent_count(agent_count)
     archetypes = selected_archetypes(count)
-    resolved_model = resolve_openrouter_model(model)
-    fast_model = resolve_openrouter_model(
-        model or DEFAULT_OPENROUTER_MODEL,
-    )
-
     user_prompt = _build_generation_prompt(trimmed, web_data, count)
 
     try:
-        completion = await client.chat.completions.create(
-            model=fast_model,
-            messages=[
-                {"role": "system", "content": PERSONA_GENERATION_SYSTEM},
-                {"role": "user", "content": user_prompt},
-            ],
+        raw_text, model_used = await chat_completion_with_fallback(
+            client,
+            model,
+            PERSONA_GENERATION_SYSTEM,
+            user_prompt,
             temperature=0.65,
             max_tokens=1800 + count * 400,
         )
-        raw_text = (completion.choices[0].message.content or "").strip()
         parsed = _parse_personas_json(raw_text)
 
         if not parsed or len(parsed) < count:
@@ -329,7 +322,7 @@ async def generate_dynamic_personas(
             "Generated %s adversarial personas (requested=%s model=%s)",
             len(personas),
             count,
-            resolved_model,
+            model_used,
         )
         return personas
 

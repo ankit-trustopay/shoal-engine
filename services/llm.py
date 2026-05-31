@@ -13,7 +13,10 @@ from fastapi import HTTPException
 from openai import AsyncOpenAI
 
 from services.metrics import AgentSentiment, normalize_sentiment
-from services.model_router import resolve_openrouter_model
+from services.model_router import (
+    get_fallback_openrouter_model,
+    resolve_openrouter_model,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -255,6 +258,70 @@ def format_persona_system_prompt(
     )
 
 
+async def chat_completion_with_fallback(
+    client: AsyncOpenAI,
+    requested_model: str | None,
+    system_prompt: str,
+    user_prompt: str,
+    temperature: float,
+    *,
+    response_format: dict[str, str] | None = None,
+    max_tokens: int | None = None,
+) -> tuple[str, str]:
+    """
+    Call OpenRouter with the requested model; on failure, retry once with fallback.
+    Returns (response_text, model_slug_used).
+    """
+    primary = resolve_openrouter_model(requested_model)
+    fallback = get_fallback_openrouter_model(requested_model)
+    candidates = [primary] if primary == fallback else [primary, fallback]
+
+    last_error: Exception | None = None
+
+    for index, model in enumerate(candidates):
+        try:
+            kwargs: dict[str, Any] = {
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                "temperature": temperature,
+            }
+            if response_format is not None:
+                kwargs["response_format"] = response_format
+            if max_tokens is not None:
+                kwargs["max_tokens"] = max_tokens
+
+            completion = await client.chat.completions.create(**kwargs)
+            text = (completion.choices[0].message.content or "").strip()
+
+            if index > 0:
+                logger.warning(
+                    "LLM recovered via fallback model %s (requested=%r)",
+                    model,
+                    requested_model,
+                )
+
+            return text, model
+        except Exception as exc:
+            last_error = exc
+            if index == 0 and len(candidates) > 1:
+                logger.warning(
+                    "LLM call failed for model=%s (%s); retrying with fallback=%s",
+                    model,
+                    exc,
+                    fallback,
+                )
+                continue
+            logger.exception("LLM call failed for model=%s", model)
+            raise
+
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("LLM call failed without raising a concrete error")
+
+
 async def _chat_completion(
     client: AsyncOpenAI,
     model: str,
@@ -262,15 +329,14 @@ async def _chat_completion(
     user_prompt: str,
     temperature: float,
 ) -> str:
-    completion = await client.chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        temperature=temperature,
+    text, _ = await chat_completion_with_fallback(
+        client,
+        model,
+        system_prompt,
+        user_prompt,
+        temperature,
     )
-    return (completion.choices[0].message.content or "").strip()
+    return text
 
 
 def _build_reflection_critique_prompt(persona: dict, draft: str) -> str:
@@ -312,7 +378,6 @@ async def get_persona_debate_response(
     Run an adversarial debate turn with draft → self-critique → final reflection loop.
     """
     role_name = str(persona.get("role") or persona.get("name") or "Agent")
-    resolved_model = resolve_openrouter_model(model)
     system_prompt = (
         f"{format_persona_system_prompt(persona, opposing_roles)}\n\n"
         f"Live web data (includes deep page extracts where available):\n{web_data}"
@@ -321,9 +386,9 @@ async def get_persona_debate_response(
     premise_block = f"User premise:\n{user_message.strip()}"
 
     try:
-        draft = await _chat_completion(
+        draft, model_used = await chat_completion_with_fallback(
             client,
-            resolved_model,
+            model,
             system_prompt,
             (
                 f"{premise_block}\n\n"
@@ -333,17 +398,17 @@ async def get_persona_debate_response(
             temperature=0.6,
         )
 
-        critique = await _chat_completion(
+        critique, _ = await chat_completion_with_fallback(
             client,
-            resolved_model,
+            model_used,
             system_prompt,
             _build_reflection_critique_prompt(persona, draft),
             temperature=0.35,
         )
 
-        final_text = await _chat_completion(
+        final_text, _ = await chat_completion_with_fallback(
             client,
-            resolved_model,
+            model_used,
             system_prompt,
             _build_reflection_final_prompt(draft, critique),
             temperature=0.45,
@@ -354,19 +419,19 @@ async def get_persona_debate_response(
 
     except Exception as exc:
         logger.exception(
-            "OpenRouter reflection loop failed for %s (model=%s)",
+            "OpenRouter reflection loop failed for %s (requested=%r)",
             role_name,
-            resolved_model,
+            model,
         )
         raise HTTPException(
             status_code=502,
-            detail=f"Failed to generate response for {role_name}",
+            detail=f"Failed to generate response for {role_name}: {exc}",
         ) from exc
 
     logger.info(
         "Adversarial reflection complete for %s via %s (final=%s chars)",
         role_name,
-        resolved_model,
+        model_used,
         len(final_text),
     )
 
@@ -383,7 +448,6 @@ async def get_manager_synthesis(
 ) -> ManagerSynthesis:
     """Synthesize institutional consensus with strict JSON structure."""
     agent_count = max(1, len(agent_roles))
-    resolved_model = resolve_openrouter_model(model)
     manager_system = build_manager_system(agent_count)
 
     user_message = (
@@ -397,29 +461,30 @@ async def get_manager_synthesis(
     )
 
     try:
-        completion = await client.chat.completions.create(
-            model=resolved_model,
-            messages=[
-                {"role": "system", "content": manager_system},
-                {"role": "user", "content": user_message},
-            ],
+        raw_text, model_used = await chat_completion_with_fallback(
+            client,
+            model,
+            manager_system,
+            user_message,
             temperature=0.25,
             response_format={"type": "json_object"},
         )
     except Exception as exc:
-        logger.exception("OpenRouter error for Manager synthesis (model=%s)", resolved_model)
+        logger.exception(
+            "Manager synthesis failed after model fallback (requested=%r)",
+            model,
+        )
         raise HTTPException(
             status_code=502,
-            detail="Failed to generate manager synthesis",
+            detail=f"Failed to generate manager synthesis: {exc}",
         ) from exc
 
-    raw_text = (completion.choices[0].message.content or "").strip()
     parsed = parse_manager_synthesis_payload(raw_text, agent_roles)
 
     if parsed is not None:
         logger.info(
             "Manager synthesis via %s: sentiments=%s evidenceQuality=%s confidence=%s actions=%s",
-            resolved_model,
+            model_used,
             parsed.agent_sentiments,
             parsed.evidence_quality_score,
             parsed.confidence,
@@ -429,19 +494,18 @@ async def get_manager_synthesis(
 
     logger.warning("Manager JSON parse failed; retrying without response_format")
     try:
-        retry = await client.chat.completions.create(
-            model=resolved_model,
-            messages=[
-                {"role": "system", "content": manager_system},
-                {"role": "user", "content": user_message},
-            ],
+        retry_text, retry_model = await chat_completion_with_fallback(
+            client,
+            model_used,
+            manager_system,
+            user_message,
             temperature=0.2,
         )
-        retry_text = (retry.choices[0].message.content or "").strip()
         parsed_retry = parse_manager_synthesis_payload(retry_text, agent_roles)
         if parsed_retry is not None:
             return parsed_retry
         raw_text = retry_text
+        model_used = retry_model
     except Exception:
         logger.exception("Manager synthesis retry failed")
 
