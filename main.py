@@ -46,6 +46,8 @@ class AgentProfilePayload(BaseModel):
     age: int = Field(..., ge=18, le=80)
     location: str
     income: str
+    maritalStatus: str = ""
+    culturalBackground: str = ""
     iq: int = Field(..., ge=90, le=140)
     eq: int = Field(..., ge=90, le=140)
     riskTolerance: str
@@ -115,6 +117,8 @@ async def ignite(payload: IgniteRequest) -> IgniteResponse:
             age=profile["age"],
             location=profile["location"],
             income=profile["income"],
+            maritalStatus=profile.get("maritalStatus", ""),
+            culturalBackground=profile.get("culturalBackground", ""),
             iq=profile["iq"],
             eq=profile["eq"],
             riskTolerance=profile["riskTolerance"],
