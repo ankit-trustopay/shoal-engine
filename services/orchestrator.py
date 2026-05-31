@@ -1,10 +1,13 @@
 """Multi-agent swarm orchestration (parallel human vectors + manager synthesis)."""
 
+from __future__ import annotations
+
 import asyncio
 import logging
+from dataclasses import dataclass
 
 from services.llm import get_agent_response, get_client
-from services.scraper import search_web
+from services.scraper import EvidenceItem, scrape_for_premise
 
 logger = logging.getLogger(__name__)
 
@@ -43,17 +46,23 @@ PERSONAS: list[tuple[str, str]] = [
 ]
 
 
-async def run_swarm_ignite(swarm_id: str, premise: str) -> list[dict[str, str]]:
+@dataclass
+class SwarmIgniteResult:
+    messages: list[dict[str, str]]
+    evidence: list[EvidenceItem]
+
+
+async def run_swarm_ignite(swarm_id: str, premise: str) -> SwarmIgniteResult:
     """
     Execute web search, parallel agent debate, and manager consensus.
-    Returns a list of message dicts: {role, text}.
+    Returns debate messages plus structured evidence from the scraper.
     """
     client = get_client()
     trimmed_premise = premise.strip()
 
     logger.info("Starting parallel orchestration for swarm %s", swarm_id)
 
-    web_data = await asyncio.to_thread(search_web, trimmed_premise)
+    web_data, evidence = await asyncio.to_thread(scrape_for_premise, trimmed_premise)
     logger.debug(
         "Web data preview for swarm %s: %s",
         swarm_id,
@@ -96,4 +105,7 @@ async def run_swarm_ignite(swarm_id: str, premise: str) -> list[dict[str, str]]:
         len(agent_results),
     )
 
-    return [*agent_results, manager_result]
+    return SwarmIgniteResult(
+        messages=[*agent_results, manager_result],
+        evidence=evidence,
+    )
