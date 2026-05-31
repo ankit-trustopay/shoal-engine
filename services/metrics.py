@@ -5,7 +5,6 @@ from __future__ import annotations
 import re
 
 DEFAULT_SWARM_SIZE = 1000
-CREDITS_PER_100_AGENTS = 1.0
 
 _POSITIVE_TERMS = (
     "recommend",
@@ -125,9 +124,9 @@ def compute_extrapolated_votes(
 
 
 def compute_swarm_credits(swarm_size: int) -> float:
-    """1 credit per 100 simulated agents (1,000 agents = 10.0 credits)."""
+    """1 virtual human = 1 credit (100 agents = 100.0, 1,000 agents = 1,000.0)."""
     size = max(1, int(swarm_size))
-    return round((size / 100.0) * CREDITS_PER_100_AGENTS, 1)
+    return float(size)
 
 
 # Backward-compatible alias
