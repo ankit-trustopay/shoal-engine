@@ -8,8 +8,8 @@ from typing import Self
 
 from services.metrics import (
     DEFAULT_SWARM_SIZE,
-    compute_confidence,
-    compute_extrapolated_votes,
+    compute_confidence_from_sentiments,
+    compute_extrapolated_votes_from_sentiments,
     compute_swarm_credits,
 )
 from services.orchestrator import run_swarm_ignite
@@ -65,6 +65,12 @@ class AgentProfilePayload(BaseModel):
     backstory: str
 
 
+class RecommendedActionPayload(BaseModel):
+    step: int = Field(..., ge=1)
+    title: str = Field(..., min_length=1)
+    body: str = Field(..., min_length=1)
+
+
 class IgniteResponse(BaseModel):
     status: str
     swarmId: str
@@ -78,6 +84,8 @@ class IgniteResponse(BaseModel):
     evidence: list[EvidencePayload]
     agentProfiles: list[AgentProfilePayload]
     swarmSize: int = Field(default=DEFAULT_SWARM_SIZE, ge=1)
+    recommendedActions: list[RecommendedActionPayload] = Field(default_factory=list)
+    minorityDissent: str | None = None
 
 
 @app.get("/health")
@@ -99,23 +107,29 @@ async def ignite(payload: IgniteRequest) -> IgniteResponse:
         for msg in result.messages
     ]
 
-    manager_text = next(
-        (msg.text for msg in messages if msg.role == "Manager"),
-        "",
+    synthesis = result.manager_synthesis
+    sentiments = synthesis.agent_sentiments
+
+    confidence = compute_confidence_from_sentiments(
+        sentiments,
+        manager_confidence=synthesis.confidence,
     )
-
-    leader_texts = [
-        msg.text for msg in messages if msg.role != "Manager"
-    ]
-
-    confidence = compute_confidence(manager_text)
-    votes_for, votes_against, votes_neutral = compute_extrapolated_votes(
-        confidence,
-        manager_text,
-        leader_texts,
+    votes_for, votes_against, votes_neutral = compute_extrapolated_votes_from_sentiments(
+        sentiments,
         swarm_size=payload.swarmSize,
     )
     cost = compute_swarm_credits(payload.swarmSize)
+
+    recommended_actions = [
+        RecommendedActionPayload(
+            step=action.step,
+            title=action.title,
+            body=action.body,
+        )
+        for action in synthesis.recommended_actions
+    ]
+
+    minority_dissent = synthesis.minority_dissent or None
 
     evidence = [
         EvidencePayload(
@@ -159,4 +173,6 @@ async def ignite(payload: IgniteRequest) -> IgniteResponse:
         evidence=evidence,
         agentProfiles=agent_profiles,
         swarmSize=payload.swarmSize,
+        recommendedActions=recommended_actions,
+        minorityDissent=minority_dissent,
     )

@@ -3,8 +3,13 @@
 from __future__ import annotations
 
 import re
+from typing import Literal
 
 DEFAULT_SWARM_SIZE = 1000
+
+AgentSentiment = Literal["For", "Against", "Neutral"]
+
+_VALID_SENTIMENTS = frozenset({"For", "Against", "Neutral"})
 
 _POSITIVE_TERMS = (
     "recommend",
@@ -40,6 +45,22 @@ _NEGATIVE_TERMS = (
 )
 
 
+def normalize_sentiment(value: str | None) -> AgentSentiment | None:
+    if not value:
+        return None
+    cleaned = value.strip().capitalize()
+    if cleaned in _VALID_SENTIMENTS:
+        return cleaned  # type: ignore[return-value]
+    lowered = value.strip().lower()
+    if lowered in ("for", "pro", "support", "supporting", "yes"):
+        return "For"
+    if lowered in ("against", "con", "oppose", "opposing", "no", "reject"):
+        return "Against"
+    if lowered in ("neutral", "undecided", "abstain", "mixed"):
+        return "Neutral"
+    return None
+
+
 def score_text_sentiment(text: str) -> float:
     """Rough sentiment in [-1.0, 1.0] from keyword hits."""
     lowered = text.lower()
@@ -58,38 +79,53 @@ def score_text_sentiment(text: str) -> float:
     return max(-1.0, min(1.0, raw))
 
 
-def score_manager_sentiment(manager_text: str) -> float:
-    return score_text_sentiment(manager_text)
+def compute_confidence_from_sentiments(
+    sentiments: list[AgentSentiment],
+    manager_confidence: int | None = None,
+) -> int:
+    """Derive confidence from the dominant sentiment bloc, with optional manager override."""
+    if manager_confidence is not None:
+        return max(75, min(95, int(manager_confidence)))
 
+    if not sentiments:
+        return 75
 
-def aggregate_leader_sentiment(leader_texts: list[str]) -> float:
-    if not leader_texts:
-        return 0.0
-    scores = [score_text_sentiment(text) for text in leader_texts if text.strip()]
-    if not scores:
-        return 0.0
-    return sum(scores) / len(scores)
-
-
-def compute_confidence(manager_text: str) -> int:
-    """Realistic confidence score between 75 and 95."""
-    sentiment = score_manager_sentiment(manager_text)
-    score = 75 + int(round((sentiment + 1.0) * 10))
+    total = len(sentiments)
+    for_count = sum(1 for item in sentiments if item == "For")
+    against_count = sum(1 for item in sentiments if item == "Against")
+    dominant = max(for_count, against_count, total - for_count - against_count)
+    agreement_ratio = dominant / total
+    score = 75 + int(round(agreement_ratio * 20))
     return max(75, min(95, score))
 
 
-def _split_remainder(remainder: int, blend: float) -> tuple[int, int]:
-    """Allocate leftover votes between Against and Neutral from leader sentiment."""
-    if remainder <= 0:
-        return 0, 0
+def compute_extrapolated_votes_from_sentiments(
+    sentiments: list[AgentSentiment],
+    swarm_size: int = DEFAULT_SWARM_SIZE,
+) -> tuple[int, int, int]:
+    """
+    Extrapolate swarm-scale votes from the five-agent sentiment ratio.
 
-    # Higher blend (bullish) -> fewer Against, more Neutral
-    against_share = 0.5 - (blend * 0.38)
-    against_share = max(0.12, min(0.88, against_share))
+    Example: 4 For, 1 Against, 0 Neutral at swarm_size=1000 -> 800 / 200 / 0.
+    """
+    total = max(1, int(swarm_size))
+    panel_size = max(1, len(sentiments))
 
-    votes_against = int(round(remainder * against_share))
-    votes_neutral = remainder - votes_against
-    return votes_against, votes_neutral
+    for_count = sum(1 for item in sentiments if item == "For")
+    against_count = sum(1 for item in sentiments if item == "Against")
+
+    votes_for = (total * for_count) // panel_size
+    votes_against = (total * against_count) // panel_size
+    votes_neutral = total - votes_for - votes_against
+
+    return votes_for, votes_against, votes_neutral
+
+
+def compute_confidence(manager_text: str) -> int:
+    """Legacy keyword-based confidence for plain-text manager output."""
+    sentiment = score_text_sentiment(manager_text)
+    score = 75 + int(round((sentiment + 1.0) * 10))
+    return max(75, min(95, score))
 
 
 def compute_extrapolated_votes(
@@ -98,10 +134,7 @@ def compute_extrapolated_votes(
     leader_texts: list[str],
     swarm_size: int = DEFAULT_SWARM_SIZE,
 ) -> tuple[int, int, int]:
-    """
-    Extrapolate votes across swarm_size agents.
-    votesFor is anchored to confidence %; remainder splits by archetype sentiment.
-    """
+    """Legacy vote extrapolation anchored to confidence % — prefer sentiment-based path."""
     total = max(1, int(swarm_size))
     conf = max(0, min(100, confidence))
 
@@ -109,15 +142,16 @@ def compute_extrapolated_votes(
     votes_for = max(0, min(total, votes_for))
     remainder = total - votes_for
 
-    manager_sent = score_manager_sentiment(manager_text)
-    leader_sent = aggregate_leader_sentiment(leader_texts)
+    manager_sent = score_text_sentiment(manager_text)
+    leader_scores = [score_text_sentiment(text) for text in leader_texts if text.strip()]
+    leader_sent = sum(leader_scores) / len(leader_scores) if leader_scores else 0.0
     blend = 0.35 * manager_sent + 0.65 * leader_sent
 
-    votes_against, votes_neutral = _split_remainder(remainder, blend)
+    against_share = max(0.12, min(0.88, 0.5 - (blend * 0.38)))
+    votes_against = int(round(remainder * against_share))
+    votes_neutral = remainder - votes_against
 
-    # Guarantee exact sum
-    current = votes_for + votes_against + votes_neutral
-    if current != total:
+    if votes_for + votes_against + votes_neutral != total:
         votes_neutral = total - votes_for - votes_against
 
     return votes_for, votes_against, votes_neutral
@@ -129,7 +163,6 @@ def compute_swarm_credits(swarm_size: int) -> float:
     return float(size)
 
 
-# Backward-compatible alias
 def compute_vote_distribution(
     manager_text: str,
     total: int = DEFAULT_SWARM_SIZE,

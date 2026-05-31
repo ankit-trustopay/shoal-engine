@@ -12,17 +12,15 @@ from services.dynamic_personas import (
     generate_dynamic_personas,
     persona_to_agent_profile,
 )
-from services.llm import get_agent_response, get_client, get_persona_debate_response
+from services.llm import (
+    ManagerSynthesis,
+    get_client,
+    get_manager_synthesis,
+    get_persona_debate_response,
+)
 from services.scraper import EvidenceItem, scrape_for_premise
 
 logger = logging.getLogger(__name__)
-
-MANAGER_SYSTEM = (
-    "You are the Manager synthesizing a large simulated swarm. The five Archetype "
-    "Leaders below represent Key Voices for a much larger crowd. Read the live web "
-    "data and their perspectives, then provide a final 2-sentence definitive, "
-    "data-backed consensus."
-)
 
 
 @dataclass
@@ -30,6 +28,7 @@ class SwarmIgniteResult:
     messages: list[dict[str, str]]
     evidence: list[EvidenceItem]
     agent_profiles: list[dict[str, Any]]
+    manager_synthesis: ManagerSynthesis
 
 
 async def run_swarm_ignite(swarm_id: str, premise: str) -> SwarmIgniteResult:
@@ -71,35 +70,38 @@ async def run_swarm_ignite(swarm_id: str, premise: str) -> SwarmIgniteResult:
     ]
 
     agent_results = await asyncio.gather(*agent_tasks)
+    agent_roles = [msg["role"] for msg in agent_results]
 
     combined_perspectives = "\n\n".join(
         f"{msg['role']} ({personas[i]['name']}):\n{msg['text']}"
         for i, msg in enumerate(agent_results)
     )
-    manager_user = (
-        f"User premise:\n{trimmed_premise}\n\n"
-        f"Live web data:\n{web_data}\n\n"
-        f"Human agent perspectives:\n{combined_perspectives}"
+
+    manager_synthesis = await get_manager_synthesis(
+        client,
+        trimmed_premise,
+        web_data,
+        combined_perspectives,
+        agent_roles,
     )
 
-    manager_result = await get_agent_response(
-        client,
-        "Manager",
-        MANAGER_SYSTEM,
-        manager_user,
-        web_data,
-    )
+    manager_result = {
+        "role": "Manager",
+        "text": manager_synthesis.consensus,
+    }
 
     agent_profiles = [persona_to_agent_profile(persona) for persona in personas]
 
     logger.info(
-        "Swarm %s complete: %s agent messages + manager",
+        "Swarm %s complete: %s agent messages + manager (sentiments=%s)",
         swarm_id,
         len(agent_results),
+        manager_synthesis.agent_sentiments,
     )
 
     return SwarmIgniteResult(
         messages=[*agent_results, manager_result],
         evidence=evidence,
         agent_profiles=agent_profiles,
+        manager_synthesis=manager_synthesis,
     )

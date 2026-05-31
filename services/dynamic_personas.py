@@ -63,7 +63,7 @@ PERSONA_GENERATION_SYSTEM = (
     "as market-research vectors (no stereotypes or slurs).\n"
     "- maritalStatus: realistic (e.g. Single, Married, Married with 2 kids, Widowed).\n"
     "- iq and eq: integers 90-140, consistent with education and life story.\n"
-    "- debate_instruction: 2 sentences on how THIS archetype leader argues for their slice of the crowd.\n"
+    "- debate_instruction: 2 sentences on how THIS archetype leader argues as a tier-1 institutional analyst for their slice of the crowd (data-first, no roleplay).\n"
     '- role: specific stakeholder title (e.g. "Ahmedabad Landlord") — do NOT append "Archetype Leader" in JSON; we label in post-processing.\n'
     "Return ONLY a JSON array of 5 objects — no markdown."
 )
