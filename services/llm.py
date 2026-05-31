@@ -1,4 +1,4 @@
-"""OpenRouter / DeepSeek LLM client and agent completion helpers."""
+"""OpenRouter LLM client, model routing, and agent completion helpers."""
 
 from __future__ import annotations
 
@@ -13,50 +13,22 @@ from fastapi import HTTPException
 from openai import AsyncOpenAI
 
 from services.metrics import AgentSentiment, normalize_sentiment
+from services.model_router import resolve_openrouter_model
 
 logger = logging.getLogger(__name__)
 
-MODEL = "deepseek/deepseek-chat"
-FAST_MODEL = os.getenv("OPENROUTER_FAST_MODEL", "deepseek/deepseek-chat")
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 
-INSTITUTIONAL_AGENT_RULES = (
-    "VOICE & STYLE (mandatory):\n"
-    "- Speak as a tier-1 institutional analyst (investment bank, strategy consulting, policy think tank).\n"
-    "- Debate raw data, metrics, and causal mechanisms — cite specifics from the web data.\n"
-    "- FORBIDDEN: roleplay stage directions or physical actions (e.g. adjusts glasses, leans forward, sighs).\n"
-    "- FORBIDDEN: emotional narration, florid metaphor, or first-person character acting.\n"
-    "- Write exactly 2 sentences in crisp, evidence-dense institutional prose."
-)
-
-MANAGER_SYSTEM = (
-    "You are the Institutional Swarm Manager synthesizing five Archetype Leader "
-    "deliberations into a production-grade consensus for a large simulated crowd.\n\n"
-    "STRICT PREMISE ADHERENCE (mandatory):\n"
-    "- Read the user's premise word-by-word. Honor every explicit formatting constraint.\n"
-    '- If the premise asks for "Top 10", "top ten", "10 items", or similar, your consensus '
-    "MUST enumerate exactly 10 distinct, numbered items — no fewer, no duplicates.\n"
-    "- If the premise specifies structure (bullets, ranked list, table columns, word limit), "
-    "mirror it exactly in consensus.\n"
-    "- Never substitute a generic summary when the premise demands a specific format.\n\n"
-    "VOTE CLASSIFICATION (mandatory):\n"
-    '- For each of the five agent responses, assign exactly one sentiment: "For", "Against", or "Neutral".\n'
-    "- Classify strictly from each agent's stated position relative to the premise — not your synthesis.\n"
-    "- Use the exact agent role labels provided in the user message.\n\n"
-    "OUTPUT (valid JSON only — no markdown fences, no commentary):\n"
-    "{\n"
-    '  "consensus": "<final institutional consensus; obey premise formatting constraints>",\n'
-    '  "agentSentiments": [\n'
-    '    {"role": "<exact agent role>", "sentiment": "For"|"Against"|"Neutral"}\n'
-    "  ],\n"
-    '  "recommendedActions": [\n'
-    '    {"step": 1, "title": "<short imperative>", "body": "<specific actionable detail>"}\n'
-    "  ],\n"
-    '  "minorityDissent": "<1-2 sentences summarizing the strongest opposing argument; empty string if unanimous>",\n'
-    '  "confidence": <integer 75-95 reflecting consensus strength given the sentiment split>\n'
-    "}\n\n"
-    "recommendedActions: provide 2-3 highly specific steps grounded in consensus and evidence.\n"
-    "minorityDissent: distill the strongest counter-argument from Against/Neutral agents."
+ADVERSARIAL_AGENT_RULES = (
+    "ADVERSARIAL DEBATE (mandatory):\n"
+    "- You are in a live institutional war room defending your assigned stance to the death.\n"
+    "- Weaponize the web data — cite metrics, dates, and causal mechanisms, not vibes.\n"
+    "- Anticipate the strongest counterarguments from the opposing archetypes listed below "
+    "and preemptively attack them with evidence.\n"
+    "- Do NOT hedge, converge, seek compromise, or validate the other side.\n"
+    "- FORBIDDEN: roleplay stage directions (adjusts glasses, sighs), emotional narration, "
+    "or first-person character acting.\n"
+    "- Write exactly 2 sentences of aggressive, evidence-dense institutional prose."
 )
 
 
@@ -74,6 +46,40 @@ class ManagerSynthesis:
     recommended_actions: list[RecommendedAction] = field(default_factory=list)
     minority_dissent: str = ""
     confidence: int = 75
+
+
+def build_manager_system(agent_count: int) -> str:
+    count = max(1, int(agent_count))
+    return (
+        "You are the Institutional Swarm Manager synthesizing adversarial agent "
+        f"deliberations ({count} Key Voices) into a production-grade consensus.\n\n"
+        "STRICT PREMISE ADHERENCE (mandatory):\n"
+        "- Read the user's premise word-by-word. Honor every explicit formatting constraint.\n"
+        '- If the premise asks for "Top 10", "top ten", "10 items", or similar, your consensus '
+        "MUST enumerate exactly 10 distinct, numbered items — no fewer, no duplicates.\n"
+        "- If the premise specifies structure (bullets, ranked list, table columns, word limit), "
+        "mirror it exactly in consensus.\n"
+        "- Never substitute a generic summary when the premise demands a specific format.\n\n"
+        "VOTE CLASSIFICATION (mandatory):\n"
+        f"- For each of the {count} agent responses, assign exactly one sentiment: "
+        '"For", "Against", or "Neutral".\n'
+        "- Classify strictly from each agent's stated position relative to the premise — not your synthesis.\n"
+        "- Use the exact agent role labels provided in the user message.\n\n"
+        "OUTPUT (valid JSON only — no markdown fences, no commentary):\n"
+        "{\n"
+        '  "consensus": "<final institutional consensus; obey premise formatting constraints>",\n'
+        '  "agentSentiments": [\n'
+        '    {"role": "<exact agent role>", "sentiment": "For"|"Against"|"Neutral"}\n'
+        "  ],\n"
+        '  "recommendedActions": [\n'
+        '    {"step": 1, "title": "<short imperative>", "body": "<specific actionable detail>"}\n'
+        "  ],\n"
+        '  "minorityDissent": "<1-2 sentences summarizing the strongest opposing argument; empty string if unanimous>",\n'
+        '  "confidence": <integer 75-95 reflecting consensus strength given the sentiment split>\n'
+        "}\n\n"
+        "recommendedActions: provide 2-3 highly specific steps grounded in consensus and evidence.\n"
+        "minorityDissent: distill the strongest counter-argument from Against/Neutral agents."
+    )
 
 
 def get_client() -> AsyncOpenAI:
@@ -138,7 +144,7 @@ def resolve_panel_sentiments(
     agent_roles: list[str],
     raw_sentiments: list[dict[str, Any]],
 ) -> list[AgentSentiment]:
-    """Align manager-assigned sentiments to the five agent roles in deliberation order."""
+    """Align manager-assigned sentiments to agent roles in deliberation order."""
     resolved: list[AgentSentiment] = []
 
     for index, role in enumerate(agent_roles):
@@ -206,54 +212,28 @@ def parse_manager_synthesis_payload(
     )
 
 
-async def get_agent_response(
-    client: AsyncOpenAI,
-    role_name: str,
-    persona_instruction: str,
-    user_message: str,
-    web_data: str,
-) -> dict[str, str]:
-    system_prompt = (
-        f"You are a {role_name}. {persona_instruction}\n\n"
-        f"{INSTITUTIONAL_AGENT_RULES}\n\n"
-        f"Live web data:\n{web_data}"
+def format_persona_system_prompt(
+    persona: dict,
+    opposing_roles: list[str],
+) -> str:
+    """Build an adversarial institutional analyst prompt."""
+    opponents = (
+        "\n".join(f"- {role}" for role in opposing_roles)
+        if opposing_roles
+        else "- All other adversarial archetypes in this swarm"
     )
 
-    try:
-        completion = await client.chat.completions.create(
-            model=MODEL,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_message},
-            ],
-            temperature=0.4,
-        )
-    except Exception as exc:
-        logger.exception("OpenRouter error for role %s", role_name)
-        raise HTTPException(
-            status_code=502,
-            detail=f"Failed to generate response for {role_name}",
-        ) from exc
+    stance = persona.get("adversarial_stance") or persona.get("debate_instruction") or ""
 
-    response_text = (completion.choices[0].message.content or "").strip()
-    logger.info("Agent response received for %s (%s chars)", role_name, len(response_text))
-
-    return {"role": role_name, "text": response_text}
-
-
-def format_persona_system_prompt(persona: dict) -> str:
-    """Build an institutional analyst prompt anchored to a stakeholder archetype."""
     return (
-        f"Archetype: {persona['role']} (Key Voice for a slice of the simulated crowd)\n"
-        f"Stakeholder profile — Name: {persona['name']} | Age: {persona['age']} | "
-        f"Location: {persona['location']} | Income: {persona['income']}\n"
-        f"Marital status: {persona['maritalStatus']} | "
-        f"Cultural background: {persona['culturalBackground']}\n"
-        f"Risk tolerance: {persona['riskTolerance']} | IQ: {persona['iq']} | EQ: {persona['eq']}\n\n"
+        f"Assigned adversarial role: {persona['role']}\n"
+        f"Mandated stance: {stance}\n"
+        f"Analyst: {persona['name']} | {persona['location']} | Risk: {persona['riskTolerance']}\n\n"
         f"Analytical lens: {persona['backstory']}\n"
-        f"Known biases to stress-test: {persona['biases']}\n"
-        f"Argument focus: {persona['debate_instruction']}\n\n"
-        f"{INSTITUTIONAL_AGENT_RULES}"
+        f"Known biases (lean into them): {persona['biases']}\n"
+        f"Attack vector: {persona['debate_instruction']}\n\n"
+        f"Opposing archetypes you must anticipate and dismantle:\n{opponents}\n\n"
+        f"{ADVERSARIAL_AGENT_RULES}"
     )
 
 
@@ -262,25 +242,32 @@ async def get_persona_debate_response(
     persona: dict,
     user_message: str,
     web_data: str,
+    model: str,
+    opposing_roles: list[str],
 ) -> dict[str, str]:
-    """Run a debate turn as an institutional analyst representing a stakeholder archetype."""
+    """Run one adversarial debate turn for a persona."""
     role_name = str(persona.get("role") or persona.get("name") or "Agent")
+    resolved_model = resolve_openrouter_model(model)
     system_prompt = (
-        f"{format_persona_system_prompt(persona)}\n\n"
+        f"{format_persona_system_prompt(persona, opposing_roles)}\n\n"
         f"Live web data:\n{web_data}"
     )
 
     try:
         completion = await client.chat.completions.create(
-            model=MODEL,
+            model=resolved_model,
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_message},
             ],
-            temperature=0.45,
+            temperature=0.55,
         )
     except Exception as exc:
-        logger.exception("OpenRouter error for persona %s", role_name)
+        logger.exception(
+            "OpenRouter error for persona %s (model=%s)",
+            role_name,
+            resolved_model,
+        )
         raise HTTPException(
             status_code=502,
             detail=f"Failed to generate response for {role_name}",
@@ -288,8 +275,9 @@ async def get_persona_debate_response(
 
     response_text = (completion.choices[0].message.content or "").strip()
     logger.info(
-        "Persona debate response for %s (%s chars)",
+        "Adversarial response for %s via %s (%s chars)",
         role_name,
+        resolved_model,
         len(response_text),
     )
 
@@ -302,28 +290,34 @@ async def get_manager_synthesis(
     web_data: str,
     combined_perspectives: str,
     agent_roles: list[str],
+    model: str,
 ) -> ManagerSynthesis:
     """Synthesize institutional consensus with strict JSON structure."""
+    agent_count = max(1, len(agent_roles))
+    resolved_model = resolve_openrouter_model(model)
+    manager_system = build_manager_system(agent_count)
+
     user_message = (
         f"User premise:\n{premise.strip()}\n\n"
         f"Live web data:\n{web_data}\n\n"
-        f"Five agent perspectives (classify each sentiment strictly from these texts):\n"
+        f"{agent_count} adversarial agent perspectives "
+        "(classify each sentiment strictly from these texts):\n"
         f"{combined_perspectives}\n\n"
         "Return JSON only."
     )
 
     try:
         completion = await client.chat.completions.create(
-            model=MODEL,
+            model=resolved_model,
             messages=[
-                {"role": "system", "content": MANAGER_SYSTEM},
+                {"role": "system", "content": manager_system},
                 {"role": "user", "content": user_message},
             ],
             temperature=0.25,
             response_format={"type": "json_object"},
         )
     except Exception as exc:
-        logger.exception("OpenRouter error for Manager synthesis")
+        logger.exception("OpenRouter error for Manager synthesis (model=%s)", resolved_model)
         raise HTTPException(
             status_code=502,
             detail="Failed to generate manager synthesis",
@@ -334,7 +328,8 @@ async def get_manager_synthesis(
 
     if parsed is not None:
         logger.info(
-            "Manager synthesis parsed: sentiments=%s actions=%s",
+            "Manager synthesis via %s: sentiments=%s actions=%s",
+            resolved_model,
             parsed.agent_sentiments,
             len(parsed.recommended_actions),
         )
@@ -343,9 +338,9 @@ async def get_manager_synthesis(
     logger.warning("Manager JSON parse failed; retrying without response_format")
     try:
         retry = await client.chat.completions.create(
-            model=MODEL,
+            model=resolved_model,
             messages=[
-                {"role": "system", "content": MANAGER_SYSTEM},
+                {"role": "system", "content": manager_system},
                 {"role": "user", "content": user_message},
             ],
             temperature=0.2,
@@ -361,7 +356,7 @@ async def get_manager_synthesis(
     logger.error("Manager synthesis fallback to plain text (%s chars)", len(raw_text))
     return ManagerSynthesis(
         consensus=raw_text or "Consensus unavailable.",
-        agent_sentiments=["Neutral"] * max(1, len(agent_roles)),
+        agent_sentiments=["Neutral"] * agent_count,
         recommended_actions=[],
         minority_dissent="",
         confidence=75,

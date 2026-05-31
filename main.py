@@ -6,8 +6,8 @@ from fastapi import FastAPI
 from pydantic import BaseModel, Field, model_validator
 from typing import Self
 
+from services.dynamic_personas import MAX_DEBATE_AGENTS, clamp_agent_count
 from services.metrics import (
-    DEFAULT_SWARM_SIZE,
     compute_confidence_from_sentiments,
     compute_extrapolated_votes_from_sentiments,
     compute_swarm_credits,
@@ -27,12 +27,13 @@ app = FastAPI(title="Shoal AI Engine", version="0.1.0")
 class IgniteRequest(BaseModel):
     swarmId: str = Field(..., min_length=1)
     premise: str = Field(..., min_length=1)
-    swarmSize: int = Field(default=DEFAULT_SWARM_SIZE, ge=1, le=10_000)
-    agentCount: int | None = Field(default=None, ge=1, le=10_000)
+    agentCount: int = Field(default=5, ge=1, le=MAX_DEBATE_AGENTS)
+    model: str | None = Field(default=None)
+    swarmSize: int | None = Field(default=None, ge=1, le=10_000)
 
     @model_validator(mode="after")
     def resolve_swarm_size(self) -> Self:
-        if self.agentCount is not None:
+        if self.swarmSize is None:
             self.swarmSize = self.agentCount
         return self
 
@@ -50,7 +51,7 @@ class EvidencePayload(BaseModel):
 
 
 class AgentProfilePayload(BaseModel):
-    id: int = Field(..., ge=1, le=5)
+    id: int = Field(..., ge=1)
     name: str
     role: str
     age: int = Field(..., ge=18, le=80)
@@ -83,7 +84,9 @@ class IgniteResponse(BaseModel):
     cost: float = Field(..., ge=0)
     evidence: list[EvidencePayload]
     agentProfiles: list[AgentProfilePayload]
-    swarmSize: int = Field(default=DEFAULT_SWARM_SIZE, ge=1)
+    swarmSize: int = Field(..., ge=1)
+    agentCount: int = Field(..., ge=1)
+    model: str | None = None
     recommendedActions: list[RecommendedActionPayload] = Field(default_factory=list)
     minorityDissent: str | None = None
 
@@ -97,7 +100,14 @@ def health() -> dict[str, str]:
 async def ignite(payload: IgniteRequest) -> IgniteResponse:
     started = time.perf_counter()
 
-    result = await run_swarm_ignite(payload.swarmId, payload.premise)
+    debate_count = clamp_agent_count(payload.agentCount)
+
+    result = await run_swarm_ignite(
+        payload.swarmId,
+        payload.premise,
+        agent_count=debate_count,
+        model=payload.model,
+    )
 
     elapsed_sec = time.perf_counter() - started
     runtime = max(1, int(round(elapsed_sec)))
@@ -114,11 +124,15 @@ async def ignite(payload: IgniteRequest) -> IgniteResponse:
         sentiments,
         manager_confidence=synthesis.confidence,
     )
+
+    swarm_size = payload.swarmSize or debate_count
     votes_for, votes_against, votes_neutral = compute_extrapolated_votes_from_sentiments(
         sentiments,
-        swarm_size=payload.swarmSize,
+        swarm_size=swarm_size,
     )
-    cost = compute_swarm_credits(payload.swarmSize)
+
+    executed_agents = result.executed_agent_count
+    cost = compute_swarm_credits(executed_agents)
 
     recommended_actions = [
         RecommendedActionPayload(
@@ -172,7 +186,9 @@ async def ignite(payload: IgniteRequest) -> IgniteResponse:
         cost=cost,
         evidence=evidence,
         agentProfiles=agent_profiles,
-        swarmSize=payload.swarmSize,
+        swarmSize=swarm_size,
+        agentCount=executed_agents,
+        model=payload.model,
         recommendedActions=recommended_actions,
         minorityDissent=minority_dissent,
     )

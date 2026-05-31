@@ -1,4 +1,4 @@
-"""Context-aware persona generation from the user's premise."""
+"""Adversarial persona generation — strict conflicting roles scaled to agentCount."""
 
 from __future__ import annotations
 
@@ -10,11 +10,22 @@ from typing import Any, Literal, TypedDict
 from fastapi import HTTPException
 from openai import AsyncOpenAI
 
-from services.llm import FAST_MODEL, MODEL
+from services.model_router import DEFAULT_OPENROUTER_MODEL, resolve_openrouter_model
 
 logger = logging.getLogger(__name__)
 
 RiskTolerance = Literal["Low", "Medium", "High"]
+
+MAX_DEBATE_AGENTS = 5
+
+
+class AdversarialArchetype(TypedDict):
+    slug: str
+    role: str
+    stance: str
+    debate_instruction: str
+    risk_tolerance: RiskTolerance
+    biases: str
 
 
 class DynamicPersona(TypedDict):
@@ -32,41 +43,88 @@ class DynamicPersona(TypedDict):
     riskTolerance: RiskTolerance
     biases: str
     backstory: str
+    adversarial_stance: str
 
 
-ARCHETYPE_LEADER_LABEL = "Archetype Leader"
-KEY_VOICE_LABEL = "Key Voice"
-
-
-def format_archetype_role(base_role: str, persona_id: int) -> str:
-    """UI-facing role: one Key Voice plus Archetype Leaders for the simulated crowd."""
-    base = base_role.strip()
-    lowered = base.lower()
-    if "archetype leader" in lowered or "key voice" in lowered:
-        return base
-    label = KEY_VOICE_LABEL if persona_id == 1 else ARCHETYPE_LEADER_LABEL
-    return f"{base} · {label}"
-
+ADVERSARIAL_ARCHETYPES: list[AdversarialArchetype] = [
+    {
+        "slug": "aggressive_bull",
+        "role": "The Aggressive Bull",
+        "stance": "FOR — prosecute the upside case relentlessly; treat caution as paralysis.",
+        "debate_instruction": (
+            "Champion immediate action on the premise. Weaponize growth metrics, momentum, "
+            "and competitive timing from the web data. Attack delay as value destruction."
+        ),
+        "risk_tolerance": "High",
+        "biases": "Overweights upside tails; discounts tail-risk and execution friction.",
+    },
+    {
+        "slug": "extreme_bear",
+        "role": "The Extreme Bear / Skeptic",
+        "stance": "AGAINST — assume the premise fails under stress; prosecute downside first.",
+        "debate_instruction": (
+            "Dismantle the premise with failure modes, hidden liabilities, and adverse scenarios "
+            "from the web data. Treat bullish narratives as marketing, not evidence."
+        ),
+        "risk_tolerance": "Low",
+        "biases": "Anchors on worst-case outcomes; treats optimism as unpriced risk.",
+    },
+    {
+        "slug": "regulatory_auditor",
+        "role": "The Regulatory Auditor",
+        "stance": "NEUTRAL / BLOCK — compliance, governance, and regulatory veto power.",
+        "debate_instruction": (
+            "Interrogate legal exposure, licensing, data/privacy constraints, and policy shifts "
+            "in the web data. Block approval until regulatory landmines are bounded."
+        ),
+        "risk_tolerance": "Low",
+        "biases": "Prioritizes enforceability and audit trails over strategic upside.",
+    },
+    {
+        "slug": "capital_allocator",
+        "role": "The Capital Allocator",
+        "stance": "AGAINST / WAIT — ROI hurdle, timing, and opportunity cost.",
+        "debate_instruction": (
+            "Stress-test NPV, payback period, and capital efficiency using web data. "
+            "Argue capital is better deployed elsewhere until hurdles are cleared."
+        ),
+        "risk_tolerance": "Medium",
+        "biases": "Frames every decision as a portfolio trade-off against alternatives.",
+    },
+    {
+        "slug": "strategic_contrarian",
+        "role": "The Strategic Contrarian",
+        "stance": "MIXED — attacks consensus logic and second-order effects others ignore.",
+        "debate_instruction": (
+            "Expose flawed assumptions in both bull and bear cases using web data. "
+            "Force the room to confront non-obvious causal chains and reflexive market dynamics."
+        ),
+        "risk_tolerance": "Medium",
+        "biases": "Distrusts narrative coherence; hunts disconfirming evidence.",
+    },
+]
 
 PERSONA_GENERATION_SYSTEM = (
-    "You are a market-research persona architect for Shoal AI. "
-    "Given a user dilemma, invent exactly 5 Archetype Leaders who represent a much larger "
-    "simulated crowd (typically 1,000 agents). These five are the Key Voices — not the entire swarm, "
-    "but the deepest profiles standing in for the crowd. Personas must be hyper-localized to "
-    "geography, industry, and culture mentioned in the premise — never generic Western defaults "
-    "unless the premise is Western.\n\n"
+    "You are an adversarial debate architect for Shoal AI institutional swarms.\n"
+    "Each persona slot is PRE-ASSIGNED a fixed adversarial archetype — do NOT change the role or stance.\n"
+    "Your job: localize demographics (name, city, income, culture) to the user's premise while preserving "
+    "the assigned adversarial mandate.\n\n"
     "Rules:\n"
-    "- If India, Gujarat, or Indian cities appear, use specific Indian cities (e.g. Ahmedabad, Surat, Pune).\n"
-    "- If real estate: include stakeholders like landlords, renters, brokers, or first-time buyers.\n"
-    "- If healthcare/education/auto/etc., pick roles native to that domain.\n"
-    "- culturalBackground: describe religion, regional identity, or community context respectfully "
-    "as market-research vectors (no stereotypes or slurs).\n"
-    "- maritalStatus: realistic (e.g. Single, Married, Married with 2 kids, Widowed).\n"
-    "- iq and eq: integers 90-140, consistent with education and life story.\n"
-    "- debate_instruction: 2 sentences on how THIS archetype leader argues as a tier-1 institutional analyst for their slice of the crowd (data-first, no roleplay).\n"
-    '- role: specific stakeholder title (e.g. "Ahmedabad Landlord") — do NOT append "Archetype Leader" in JSON; we label in post-processing.\n'
-    "Return ONLY a JSON array of 5 objects — no markdown."
+    "- Honor geography/industry cues in the premise (India, EU, SaaS, M&A, etc.).\n"
+    "- Names and locales must feel credible for that context.\n"
+    "- debate_instruction must reinforce the assigned stance with premise-specific data hooks.\n"
+    "- Personas must CONFLICT — never converge or soften their assigned stance.\n"
+    "Return ONLY a JSON array — no markdown."
 )
+
+
+def clamp_agent_count(agent_count: int) -> int:
+    return max(1, min(MAX_DEBATE_AGENTS, int(agent_count)))
+
+
+def selected_archetypes(agent_count: int) -> list[AdversarialArchetype]:
+    count = clamp_agent_count(agent_count)
+    return ADVERSARIAL_ARCHETYPES[:count]
 
 
 def _clamp_int(value: Any, low: int, high: int, default: int) -> int:
@@ -77,12 +135,12 @@ def _clamp_int(value: Any, low: int, high: int, default: int) -> int:
     return max(low, min(high, number))
 
 
-def _normalize_risk(value: Any) -> RiskTolerance:
+def _normalize_risk(value: Any, fallback: RiskTolerance = "Medium") -> RiskTolerance:
     if isinstance(value, str):
         normalized = value.strip().capitalize()
         if normalized in ("Low", "Medium", "High"):
             return normalized  # type: ignore[return-value]
-    return "Medium"
+    return fallback
 
 
 def _parse_personas_json(text: str) -> list[dict[str, Any]] | None:
@@ -115,36 +173,51 @@ def _premise_hints(premise: str) -> str:
     if any(token in lower for token in ("india", "gujarat", "ahmedabad", "surat", "mumbai", "₹")):
         hints.append("Use Indian cities, ₹ income, and locally credible names.")
     if any(token in lower for token in ("real estate", "property", "rent", "landlord", "flat")):
-        hints.append("Include property-market stakeholders (buyer, seller, renter, landlord, broker).")
-    if any(token in lower for token in ("car", "vehicle", "ev ", "automotive")):
-        hints.append("Include buyers, mechanics, fleet owners, or safety-focused parents as relevant.")
+        hints.append("Anchor to property-market stakeholders and local regulation.")
+    if any(token in lower for token in ("eu ", "europe", "gdpr", "ai act")):
+        hints.append("Emphasize EU regulatory and cross-border constraints.")
     return " ".join(hints)
 
 
-def _coerce_persona(raw: dict[str, Any], index: int, premise: str) -> DynamicPersona | None:
-    role = str(raw.get("role") or raw.get("title") or "").strip()
-    name = str(raw.get("name") or "").strip()
-    debate_instruction = str(
-        raw.get("debate_instruction") or raw.get("instruction") or "",
-    ).strip()
+def _fallback_name(index: int) -> str:
+    names = ["Alex Chen", "Maria Santos", "James Okonkwo", "Elena Rossi", "David Park"]
+    return names[index % len(names)]
 
-    if not role or not name:
-        return None
 
-    if not debate_instruction:
-        debate_instruction = (
-            f"Argue from the perspective of a {role} directly affected by: {premise[:100]}."
-        )
+def _fallback_location(premise: str, index: int) -> str:
+    lower = premise.lower()
+    if any(token in lower for token in ("india", "gujarat", "₹")):
+        cities = ["Mumbai, India", "Bengaluru, India", "Ahmedabad, India", "Delhi, India", "Hyderabad, India"]
+    elif any(token in lower for token in ("eu", "europe", "gdpr")):
+        cities = ["Berlin, Germany", "Paris, France", "Amsterdam, Netherlands", "Dublin, Ireland", "Stockholm, Sweden"]
+    else:
+        cities = ["New York, NY, USA", "London, UK", "Singapore", "Toronto, Canada", "Sydney, Australia"]
+    return cities[index % len(cities)]
 
+
+def build_adversarial_persona(
+    archetype: AdversarialArchetype,
+    index: int,
+    premise: str,
+    raw: dict[str, Any] | None = None,
+) -> DynamicPersona:
+    """Materialize one adversarial persona from archetype + optional LLM enrichment."""
+    raw = raw or {}
     persona_id = index + 1
+    name = str(raw.get("name") or _fallback_name(index)).strip()
+    location = str(raw.get("location") or _fallback_location(premise, index)).strip()
+    debate_instruction = str(
+        raw.get("debate_instruction") or archetype["debate_instruction"],
+    ).strip()
 
     return {
         "id": persona_id,
         "name": name,
-        "role": format_archetype_role(role, persona_id),
+        "role": archetype["role"],
+        "adversarial_stance": archetype["stance"],
         "debate_instruction": debate_instruction,
-        "age": _clamp_int(raw.get("age"), 22, 70, 32 + index),
-        "location": str(raw.get("location") or "Unknown").strip(),
+        "age": _clamp_int(raw.get("age"), 28, 62, 34 + index * 3),
+        "location": location,
         "income": str(raw.get("income") or "Not disclosed").strip(),
         "maritalStatus": str(
             raw.get("maritalStatus") or raw.get("marital_status") or "Not specified",
@@ -152,271 +225,119 @@ def _coerce_persona(raw: dict[str, Any], index: int, premise: str) -> DynamicPer
         "culturalBackground": str(
             raw.get("culturalBackground")
             or raw.get("cultural_background")
-            or "Not specified",
+            or "Institutional analyst background",
         ).strip(),
-        "iq": _clamp_int(raw.get("iq"), 90, 140, 108 + index * 2),
-        "eq": _clamp_int(raw.get("eq"), 90, 140, 115 + index * 3),
-        "riskTolerance": _normalize_risk(raw.get("riskTolerance")),
-        "biases": str(
-            raw.get("biases")
-            or f"Frames '{premise[:50]}' through the lens of a {role}.",
-        ).strip(),
+        "iq": _clamp_int(raw.get("iq"), 95, 140, 112 + index * 2),
+        "eq": _clamp_int(raw.get("eq"), 95, 140, 118 + index),
+        "riskTolerance": _normalize_risk(
+            raw.get("riskTolerance"),
+            archetype["risk_tolerance"],
+        ),
+        "biases": str(raw.get("biases") or archetype["biases"]).strip(),
         "backstory": str(
             raw.get("backstory")
-            or f"{name} is deeply invested in this decision because it affects daily life and family obligations.",
+            or (
+                f"{name} is a tier-1 analyst assigned to prosecute the "
+                f"{archetype['role']} view on: {premise[:120]}"
+            ),
         ).strip(),
     }
 
 
-def build_fallback_personas(premise: str) -> list[DynamicPersona]:
-    """Heuristic fallback when LLM persona generation fails."""
-    lower = premise.lower()
-    india = any(
-        token in lower
-        for token in ("india", "gujarat", "ahmedabad", "surat", "vadodara", "₹")
+def build_fallback_personas(premise: str, agent_count: int) -> list[DynamicPersona]:
+    """Deterministic adversarial panel when LLM persona generation fails."""
+    archetypes = selected_archetypes(agent_count)
+    return [
+        build_adversarial_persona(archetype, index, premise)
+        for index, archetype in enumerate(archetypes)
+    ]
+
+
+def _build_generation_prompt(
+    premise: str,
+    web_data: str,
+    agent_count: int,
+) -> str:
+    archetypes = selected_archetypes(agent_count)
+    hints = _premise_hints(premise)
+    slots = "\n".join(
+        f"  Slot {index + 1}: {item['role']} — {item['stance']}"
+        for index, item in enumerate(archetypes)
     )
-    real_estate = any(
-        token in lower
-        for token in ("real estate", "property", "rent", "flat", "landlord", "housing")
+
+    return (
+        f"User dilemma:\n{premise.strip()}\n\n"
+        f"Context hints: {hints or 'Infer locale and domain from the dilemma.'}\n\n"
+        f"Optional web context:\n{web_data[:1200]}\n\n"
+        f"Generate EXACTLY {len(archetypes)} persona objects for these fixed adversarial slots:\n"
+        f"{slots}\n\n"
+        "Each object MUST include:\n"
+        "- id (matching slot number)\n"
+        "- name\n"
+        "- role (copy the assigned archetype role EXACTLY)\n"
+        "- debate_instruction (2 sentences, aggressively defend the assigned stance)\n"
+        "- age, location, income, maritalStatus, culturalBackground\n"
+        "- iq (90-140), eq (90-140), riskTolerance, biases, backstory (2-3 sentences)\n"
+        f"Return a JSON array of exactly {len(archetypes)} objects."
     )
-
-    if india and real_estate:
-        templates = [
-            {
-                "name": "Ketan P.",
-                "role": "Ahmedabad Landlord",
-                "debate_instruction": "Defend rental yield and capital appreciation in Gujarat tier-1 corridors.",
-                "location": "Ahmedabad, Gujarat, India",
-                "income": "₹22L/year",
-                "maritalStatus": "Married with 2 kids",
-                "culturalBackground": "Gujarati Patel family; values property as generational wealth",
-            },
-            {
-                "name": "Fatima S.",
-                "role": "Surat Renter & SME Owner",
-                "debate_instruction": "Push for affordable lease terms and infrastructure near textile hubs.",
-                "location": "Surat, Gujarat, India",
-                "income": "₹11L/year",
-                "maritalStatus": "Married",
-                "culturalBackground": "Sunni Muslim, Surati business community",
-            },
-            {
-                "name": "Vikram R.",
-                "role": "First-Time Home Buyer",
-                "debate_instruction": "Focus on EMI burden, RERA compliance, and commute to GIFT City.",
-                "location": "Gandhinagar, Gujarat, India",
-                "income": "₹14L/year",
-                "maritalStatus": "Married, expecting first child",
-                "culturalBackground": "Hindu, Gujarati; joint-family savings norms",
-            },
-            {
-                "name": "Neha M.",
-                "role": "Property Broker",
-                "debate_instruction": "Highlight transaction velocity and developer track records.",
-                "location": "Vadodara, Gujarat, India",
-                "income": "₹16L/year (commission-heavy)",
-                "maritalStatus": "Single",
-                "culturalBackground": "Urban Gujarati professional",
-            },
-            {
-                "name": "Hassan K.",
-                "role": "Skeptical Civil Engineer",
-                "debate_instruction": "Warn about construction quality, water logging, and approval risks.",
-                "location": "Rajkot, Gujarat, India",
-                "income": "₹9L/year",
-                "maritalStatus": "Married with 1 kid",
-                "culturalBackground": "Gujarati Muslim; technical skepticism",
-            },
-        ]
-    elif india:
-        templates = [
-            {
-                "name": "Rajesh K.",
-                "role": "Budget-Conscious IT Analyst",
-                "debate_instruction": "Stress total cost of ownership and family savings goals.",
-                "location": "Pune, Maharashtra, India",
-                "income": "₹9.5L/year",
-                "maritalStatus": "Married with 2 kids",
-                "culturalBackground": "Marathi-speaking middle class",
-            },
-            {
-                "name": "Priya N.",
-                "role": "Risk-Averse Parent",
-                "debate_instruction": "Prioritize safety, reliability, and school commute practicality.",
-                "location": "Bengaluru, Karnataka, India",
-                "income": "₹12L/year",
-                "maritalStatus": "Married with 2 school-age children",
-                "culturalBackground": "Tamil Brahmin household",
-            },
-            {
-                "name": "Arjun M.",
-                "role": "Status-Conscious Professional",
-                "debate_instruction": "Argue for premium options that signal career success.",
-                "location": "Mumbai, India",
-                "income": "₹18L/year",
-                "maritalStatus": "Single",
-                "culturalBackground": "Urban cosmopolitan",
-            },
-            {
-                "name": "Sunita D.",
-                "role": "Small Business Owner",
-                "debate_instruction": "Evaluate cash-flow impact and GST/documentation clarity.",
-                "location": "Jaipur, Rajasthan, India",
-                "income": "₹7L/year",
-                "maritalStatus": "Widowed, supports parents",
-                "culturalBackground": "Rajasthani trading family",
-            },
-            {
-                "name": "Imran Q.",
-                "role": "Skeptical Field Expert",
-                "debate_instruction": "Challenge marketing claims with on-the-ground experience.",
-                "location": "Hyderabad, Telangana, India",
-                "income": "₹10L/year",
-                "maritalStatus": "Married",
-                "culturalBackground": "Hyderabadi Muslim professional",
-            },
-        ]
-    else:
-        templates = [
-            {
-                "name": "Marcus L.",
-                "role": "Performance Enthusiast",
-                "debate_instruction": "Champion top specs and long-term quality over upfront price.",
-                "location": "Austin, TX, USA",
-                "income": "$152K/year",
-                "maritalStatus": "Single",
-                "culturalBackground": "White American tech worker",
-            },
-            {
-                "name": "Priya S.",
-                "role": "Safety-Focused Parent",
-                "debate_instruction": "Prioritize reliability and worst-case risk mitigation.",
-                "location": "Suburban Chicago, IL, USA",
-                "income": "$94K/year",
-                "maritalStatus": "Married with 2 teens",
-                "culturalBackground": "Indian-American nurse",
-            },
-            {
-                "name": "James T.",
-                "role": "Budget Shopper",
-                "debate_instruction": "Attack hidden fees and argue for delaying until value is proven.",
-                "location": "Columbus, OH, USA",
-                "income": "$58K/year",
-                "maritalStatus": "Married with 1 child",
-                "culturalBackground": "Midwest working class",
-            },
-            {
-                "name": "Elena R.",
-                "role": "Brand & Lifestyle Buyer",
-                "debate_instruction": "Focus on perception, design, and social signaling.",
-                "location": "Miami, FL, USA",
-                "income": "$110K/year",
-                "maritalStatus": "Divorced",
-                "culturalBackground": "Cuban-American marketing manager",
-            },
-            {
-                "name": "David C.",
-                "role": "Skeptical Industry Veteran",
-                "debate_instruction": "Expose flaws, recalls, and fine-print traps from experience.",
-                "location": "Detroit, MI, USA",
-                "income": "$71K/year",
-                "maritalStatus": "Married",
-                "culturalBackground": "African-American automotive technician",
-            },
-        ]
-
-    personas: list[DynamicPersona] = []
-    for index, template in enumerate(templates):
-        raw = {
-            **template,
-            "iq": 108 + index * 4,
-            "eq": 112 + index * 5,
-            "riskTolerance": ["Low", "Medium", "High", "Medium", "Low"][index],
-            "biases": f"Strongly filters '{premise[:40]}' through personal lived experience.",
-            "backstory": (
-                f"{template['name']} lives in {template['location']} and is directly affected by "
-                f"the dilemma: {premise[:90]}."
-            ),
-        }
-        persona = _coerce_persona(raw, index, premise)
-        if persona:
-            personas.append(persona)
-
-    return personas
 
 
 async def generate_dynamic_personas(
     client: AsyncOpenAI,
     premise: str,
     web_data: str,
+    agent_count: int,
+    model: str | None = None,
 ) -> list[DynamicPersona]:
-    """
-    Fast LLM pass: 5 context-aware personas with deep demographic vectors.
-    """
+    """Generate exactly agent_count adversarial personas with conflicting mandates."""
     trimmed = premise.strip()
-    hints = _premise_hints(trimmed)
-
-    user_prompt = (
-        f"User dilemma:\n{trimmed}\n\n"
-        f"Context hints: {hints or 'Infer locale and stakeholders from the dilemma.'}\n\n"
-        f"Optional web context:\n{web_data[:1200]}\n\n"
-        "Return a JSON array of exactly 5 persona objects. Each object MUST include:\n"
-        '- id (1-5)\n'
-        '- name (realistic full name with initial)\n'
-        '- role (specific stakeholder title, NOT generic)\n'
-        '- debate_instruction (2 sentences)\n'
-        "- age (integer)\n"
-        "- location (specific city + region + country)\n"
-        '- income (localized string, e.g. "₹12L/year")\n'
-        '- maritalStatus (string)\n'
-        '- culturalBackground (respectful market-research description)\n'
-        "- iq (90-140)\n"
-        "- eq (90-140)\n"
-        '- riskTolerance ("Low", "Medium", or "High")\n'
-        "- biases (one sentence)\n"
-        "- backstory (2-3 sentences)"
+    count = clamp_agent_count(agent_count)
+    archetypes = selected_archetypes(count)
+    resolved_model = resolve_openrouter_model(model)
+    fast_model = resolve_openrouter_model(
+        model or DEFAULT_OPENROUTER_MODEL,
     )
+
+    user_prompt = _build_generation_prompt(trimmed, web_data, count)
 
     try:
         completion = await client.chat.completions.create(
-            model=FAST_MODEL,
+            model=fast_model,
             messages=[
                 {"role": "system", "content": PERSONA_GENERATION_SYSTEM},
                 {"role": "user", "content": user_prompt},
             ],
-            temperature=0.75,
-            max_tokens=2500,
+            temperature=0.65,
+            max_tokens=1800 + count * 400,
         )
         raw_text = (completion.choices[0].message.content or "").strip()
         parsed = _parse_personas_json(raw_text)
 
-        if not parsed or len(parsed) < 5:
-            logger.warning("Persona JSON invalid; using fallback (%s chars)", len(raw_text))
-            return build_fallback_personas(trimmed)
+        if not parsed or len(parsed) < count:
+            logger.warning(
+                "Adversarial persona JSON invalid (%s items); using fallback",
+                len(parsed or []),
+            )
+            return build_fallback_personas(trimmed, count)
 
         personas: list[DynamicPersona] = []
-        for index, item in enumerate(parsed[:5]):
-            if not isinstance(item, dict):
-                continue
-            persona = _coerce_persona(item, index, trimmed)
-            if persona:
-                personas.append(persona)
+        for index, archetype in enumerate(archetypes):
+            item = parsed[index] if index < len(parsed) and isinstance(parsed[index], dict) else {}
+            personas.append(build_adversarial_persona(archetype, index, trimmed, item))
 
-        if len(personas) < 5:
-            logger.warning("Only %s personas parsed; using fallback", len(personas))
-            return build_fallback_personas(trimmed)
-
-        for index, persona in enumerate(personas):
-            persona["id"] = index + 1
-
-        logger.info("Generated %s dynamic personas for premise", len(personas))
+        logger.info(
+            "Generated %s adversarial personas (requested=%s model=%s)",
+            len(personas),
+            count,
+            resolved_model,
+        )
         return personas
 
     except Exception as exc:
-        logger.exception("Dynamic persona generation failed: %s", exc)
+        logger.exception("Adversarial persona generation failed: %s", exc)
         if isinstance(exc, HTTPException):
             raise
-        return build_fallback_personas(trimmed)
+        return build_fallback_personas(trimmed, count)
 
 
 def persona_to_agent_profile(persona: DynamicPersona) -> dict[str, Any]:
