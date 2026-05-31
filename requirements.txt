@@ -3,4 +3,4 @@ uvicorn
 pydantic
 openai
 python-dotenv
-duckduckgo-search
+requests

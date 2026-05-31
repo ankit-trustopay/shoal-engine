@@ -1,8 +1,8 @@
 import asyncio
 import os
 
+import requests
 from dotenv import load_dotenv
-from duckduckgo_search import DDGS
 from fastapi import FastAPI, HTTPException
 from openai import AsyncOpenAI
 from pydantic import BaseModel, Field
@@ -77,29 +77,68 @@ def get_client() -> AsyncOpenAI:
     )
 
 
+SEARXNG_URLS = [
+    "https://searx.be/search",
+    "https://searx.tiekoetter.com/search",
+    "https://search.mdn.eu/search",
+]
+
+SEARXNG_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36"
+    ),
+}
+
+
 def search_web(query: str) -> str:
-    """Scrape top 3 live web results for the premise."""
-    try:
-        results = DDGS().text(query, max_results=3)
-    except Exception as exc:
-        print(f"[search_web] DuckDuckGo error: {exc}")
-        return "No live web data available."
+    """Fetch top 3 live web results via public SearxNG instances."""
+    params = {"q": query, "format": "json"}
 
-    if not results:
-        return "No live web results found for this query."
+    for url in SEARXNG_URLS:
+        try:
+            response = requests.get(
+                url,
+                headers=SEARXNG_HEADERS,
+                params=params,
+                timeout=5,
+            )
+        except requests.RequestException as exc:
+            print(f"[search_web] Request failed ({url}): {exc}")
+            continue
 
-    chunks: list[str] = []
-    for index, result in enumerate(results, start=1):
-        title = result.get("title", "Untitled")
-        body = result.get("body", "")
-        href = result.get("href", "")
-        chunks.append(
-            f"[{index}] {title}\n{body}\nSource: {href}".strip(),
+        if response.status_code != 200:
+            print(
+                f"[search_web] Non-200 from {url}: "
+                f"{response.status_code}",
+            )
+            continue
+
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            print(f"[search_web] Invalid JSON from {url}: {exc}")
+            continue
+
+        results = payload.get("results", [])[:3]
+        if not results:
+            print(f"[search_web] No results from {url}")
+            continue
+
+        chunks: list[str] = []
+        for index, result in enumerate(results, start=1):
+            title = result.get("title", "Untitled")
+            content = result.get("content", "")
+            chunks.append(f"[{index}] {title}\n{content}".strip())
+
+        combined = "\n\n".join(chunks)
+        print(
+            f"[search_web] Retrieved {len(results)} results from {url} "
+            f"for: {query[:80]}",
         )
+        return combined
 
-    combined = "\n\n".join(chunks)
-    print(f"[search_web] Retrieved {len(results)} results for: {query[:80]}")
-    return combined
+    return "Live web search currently unavailable."
 
 
 async def get_agent_response(
