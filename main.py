@@ -39,6 +39,20 @@ class EvidencePayload(BaseModel):
     snippet: str
 
 
+class AgentProfilePayload(BaseModel):
+    id: int = Field(..., ge=1, le=5)
+    name: str
+    role: str
+    age: int = Field(..., ge=18, le=80)
+    location: str
+    income: str
+    iq: int = Field(..., ge=90, le=140)
+    eq: int = Field(..., ge=90, le=140)
+    riskTolerance: str
+    biases: str
+    backstory: str
+
+
 class IgniteResponse(BaseModel):
     status: str
     swarmId: str
@@ -50,6 +64,7 @@ class IgniteResponse(BaseModel):
     runtime: int = Field(..., ge=0)
     cost: float = Field(..., ge=0)
     evidence: list[EvidencePayload]
+    agentProfiles: list[AgentProfilePayload]
 
 
 @app.get("/health")
@@ -92,6 +107,23 @@ async def ignite(payload: IgniteRequest) -> IgniteResponse:
         for item in result.evidence
     ]
 
+    agent_profiles = [
+        AgentProfilePayload(
+            id=profile["id"],
+            name=profile["name"],
+            role=profile["role"],
+            age=profile["age"],
+            location=profile["location"],
+            income=profile["income"],
+            iq=profile["iq"],
+            eq=profile["eq"],
+            riskTolerance=profile["riskTolerance"],
+            biases=profile["biases"],
+            backstory=profile["backstory"],
+        )
+        for profile in result.agent_profiles
+    ]
+
     return IgniteResponse(
         status="Swarm ignited",
         swarmId=payload.swarmId,
@@ -103,4 +135,5 @@ async def ignite(payload: IgniteRequest) -> IgniteResponse:
         runtime=runtime,
         cost=cost,
         evidence=evidence,
+        agentProfiles=agent_profiles,
     )

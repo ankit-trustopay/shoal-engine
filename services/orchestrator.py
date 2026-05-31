@@ -6,6 +6,7 @@ import asyncio
 import logging
 from dataclasses import dataclass
 
+from services.agent_profiles import AgentProfile, generate_agent_profiles
 from services.llm import get_agent_response, get_client
 from services.scraper import EvidenceItem, scrape_for_premise
 
@@ -50,6 +51,7 @@ PERSONAS: list[tuple[str, str]] = [
 class SwarmIgniteResult:
     messages: list[dict[str, str]]
     evidence: list[EvidenceItem]
+    agent_profiles: list[AgentProfile]
 
 
 async def run_swarm_ignite(swarm_id: str, premise: str) -> SwarmIgniteResult:
@@ -80,7 +82,10 @@ async def run_swarm_ignite(swarm_id: str, premise: str) -> SwarmIgniteResult:
         for role_name, instruction in PERSONAS
     ]
 
-    agent_results = await asyncio.gather(*agent_tasks)
+    agent_results, agent_profiles = await asyncio.gather(
+        asyncio.gather(*agent_tasks),
+        generate_agent_profiles(client, trimmed_premise, web_data),
+    )
 
     combined_perspectives = "\n\n".join(
         f"{msg['role']}:\n{msg['text']}" for msg in agent_results
@@ -108,4 +113,5 @@ async def run_swarm_ignite(swarm_id: str, premise: str) -> SwarmIgniteResult:
     return SwarmIgniteResult(
         messages=[*agent_results, manager_result],
         evidence=evidence,
+        agent_profiles=agent_profiles,
     )
