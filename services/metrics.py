@@ -1,10 +1,11 @@
-"""Swarm outcome metrics derived from the Manager consensus."""
+"""Swarm outcome metrics: confidence, vote extrapolation, and credit costing."""
 
 from __future__ import annotations
 
 import re
 
-TOTAL_AGENTS = 50
+DEFAULT_SWARM_SIZE = 1000
+CREDITS_PER_100_AGENTS = 1.0
 
 _POSITIVE_TERMS = (
     "recommend",
@@ -40,25 +41,35 @@ _NEGATIVE_TERMS = (
 )
 
 
-def score_manager_sentiment(manager_text: str) -> float:
-    """
-    Rough sentiment in [-1.0, 1.0] from keyword hits on the Manager verdict.
-    """
-    text = manager_text.lower()
-    if not text.strip():
+def score_text_sentiment(text: str) -> float:
+    """Rough sentiment in [-1.0, 1.0] from keyword hits."""
+    lowered = text.lower()
+    if not lowered.strip():
         return 0.0
 
-    pos = sum(1 for term in _POSITIVE_TERMS if term in text)
-    neg = sum(1 for term in _NEGATIVE_TERMS if term in text)
+    pos = sum(1 for term in _POSITIVE_TERMS if term in lowered)
+    neg = sum(1 for term in _NEGATIVE_TERMS if term in lowered)
 
     if pos == 0 and neg == 0:
-        # Mild boost when the manager sounds decisive without keyword hits
-        if re.search(r"\b(should|will|best option|consensus)\b", text):
+        if re.search(r"\b(should|will|best option|consensus)\b", lowered):
             return 0.25
         return 0.0
 
     raw = (pos - neg) / (pos + neg)
     return max(-1.0, min(1.0, raw))
+
+
+def score_manager_sentiment(manager_text: str) -> float:
+    return score_text_sentiment(manager_text)
+
+
+def aggregate_leader_sentiment(leader_texts: list[str]) -> float:
+    if not leader_texts:
+        return 0.0
+    scores = [score_text_sentiment(text) for text in leader_texts if text.strip()]
+    if not scores:
+        return 0.0
+    return sum(scores) / len(scores)
 
 
 def compute_confidence(manager_text: str) -> int:
@@ -68,35 +79,61 @@ def compute_confidence(manager_text: str) -> int:
     return max(75, min(95, score))
 
 
-def compute_vote_distribution(
+def _split_remainder(remainder: int, blend: float) -> tuple[int, int]:
+    """Allocate leftover votes between Against and Neutral from leader sentiment."""
+    if remainder <= 0:
+        return 0, 0
+
+    # Higher blend (bullish) -> fewer Against, more Neutral
+    against_share = 0.5 - (blend * 0.38)
+    against_share = max(0.12, min(0.88, against_share))
+
+    votes_against = int(round(remainder * against_share))
+    votes_neutral = remainder - votes_against
+    return votes_against, votes_neutral
+
+
+def compute_extrapolated_votes(
+    confidence: int,
     manager_text: str,
-    total: int = TOTAL_AGENTS,
+    leader_texts: list[str],
+    swarm_size: int = DEFAULT_SWARM_SIZE,
 ) -> tuple[int, int, int]:
     """
-    Simulate a vote split across total agents, aligned with Manager sentiment.
-    Default bullish split: 28 For, 10 Against, 12 Neutral.
+    Extrapolate votes across swarm_size agents.
+    votesFor is anchored to confidence %; remainder splits by archetype sentiment.
     """
-    sentiment = score_manager_sentiment(manager_text)
+    total = max(1, int(swarm_size))
+    conf = max(0, min(100, confidence))
 
-    if sentiment > 0.2:
-        votes_for, votes_against, votes_neutral = 28, 10, 12
-    elif sentiment < -0.2:
-        votes_for, votes_against, votes_neutral = 12, 26, 12
-    else:
-        votes_for, votes_against, votes_neutral = 20, 14, 16
+    votes_for = int(round(total * conf / 100))
+    votes_for = max(0, min(total, votes_for))
+    remainder = total - votes_for
 
+    manager_sent = score_manager_sentiment(manager_text)
+    leader_sent = aggregate_leader_sentiment(leader_texts)
+    blend = 0.35 * manager_sent + 0.65 * leader_sent
+
+    votes_against, votes_neutral = _split_remainder(remainder, blend)
+
+    # Guarantee exact sum
     current = votes_for + votes_against + votes_neutral
     if current != total:
-        scale = total / current
-        votes_for = int(round(votes_for * scale))
-        votes_against = int(round(votes_against * scale))
         votes_neutral = total - votes_for - votes_against
 
     return votes_for, votes_against, votes_neutral
 
 
-def compute_mock_cost(runtime_sec: int, message_count: int) -> float:
-    """Mock API cost — typically ~0.04 for a standard swarm run."""
-    base = 0.028 + message_count * 0.002
-    runtime_component = runtime_sec * 0.0005
-    return round(max(0.04, base + runtime_component), 2)
+def compute_swarm_credits(swarm_size: int) -> float:
+    """1 credit per 100 simulated agents (1,000 agents = 10.0 credits)."""
+    size = max(1, int(swarm_size))
+    return round((size / 100.0) * CREDITS_PER_100_AGENTS, 1)
+
+
+# Backward-compatible alias
+def compute_vote_distribution(
+    manager_text: str,
+    total: int = DEFAULT_SWARM_SIZE,
+) -> tuple[int, int, int]:
+    confidence = compute_confidence(manager_text)
+    return compute_extrapolated_votes(confidence, manager_text, [], total)

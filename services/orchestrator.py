@@ -18,9 +18,10 @@ from services.scraper import EvidenceItem, scrape_for_premise
 logger = logging.getLogger(__name__)
 
 MANAGER_SYSTEM = (
-    "You are the Manager. Read the live web data and the 5 human agent "
-    "perspectives, then provide a final 2-sentence definitive, data-backed "
-    "consensus."
+    "You are the Manager synthesizing a large simulated swarm. The five Archetype "
+    "Leaders below represent Key Voices for a much larger crowd. Read the live web "
+    "data and their perspectives, then provide a final 2-sentence definitive, "
+    "data-backed consensus."
 )
 
 

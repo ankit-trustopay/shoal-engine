@@ -3,12 +3,14 @@ import time
 
 from dotenv import load_dotenv
 from fastapi import FastAPI
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
+from typing import Self
 
 from services.metrics import (
+    DEFAULT_SWARM_SIZE,
     compute_confidence,
-    compute_mock_cost,
-    compute_vote_distribution,
+    compute_extrapolated_votes,
+    compute_swarm_credits,
 )
 from services.orchestrator import run_swarm_ignite
 
@@ -25,6 +27,14 @@ app = FastAPI(title="Shoal AI Engine", version="0.1.0")
 class IgniteRequest(BaseModel):
     swarmId: str = Field(..., min_length=1)
     premise: str = Field(..., min_length=1)
+    swarmSize: int = Field(default=DEFAULT_SWARM_SIZE, ge=1, le=10_000)
+    agentCount: int | None = Field(default=None, ge=1, le=10_000)
+
+    @model_validator(mode="after")
+    def resolve_swarm_size(self) -> Self:
+        if self.agentCount is not None:
+            self.swarmSize = self.agentCount
+        return self
 
 
 class DebateMessage(BaseModel):
@@ -67,6 +77,7 @@ class IgniteResponse(BaseModel):
     cost: float = Field(..., ge=0)
     evidence: list[EvidencePayload]
     agentProfiles: list[AgentProfilePayload]
+    swarmSize: int = Field(default=DEFAULT_SWARM_SIZE, ge=1)
 
 
 @app.get("/health")
@@ -93,11 +104,18 @@ async def ignite(payload: IgniteRequest) -> IgniteResponse:
         "",
     )
 
+    leader_texts = [
+        msg.text for msg in messages if msg.role != "Manager"
+    ]
+
     confidence = compute_confidence(manager_text)
-    votes_for, votes_against, votes_neutral = compute_vote_distribution(
+    votes_for, votes_against, votes_neutral = compute_extrapolated_votes(
+        confidence,
         manager_text,
+        leader_texts,
+        swarm_size=payload.swarmSize,
     )
-    cost = compute_mock_cost(runtime, len(messages))
+    cost = compute_swarm_credits(payload.swarmSize)
 
     evidence = [
         EvidencePayload(
@@ -140,4 +158,5 @@ async def ignite(payload: IgniteRequest) -> IgniteResponse:
         cost=cost,
         evidence=evidence,
         agentProfiles=agent_profiles,
+        swarmSize=payload.swarmSize,
     )

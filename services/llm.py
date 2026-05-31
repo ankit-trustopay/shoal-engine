@@ -67,7 +67,7 @@ def format_persona_system_prompt(persona: dict) -> str:
     """Build an in-character system prompt from a dynamic persona profile."""
     return (
         f"You ARE {persona['name']}, a real person in a swarm debate. Stay fully in character.\n\n"
-        f"Public role label: {persona['role']}\n"
+        f"Archetype role (Key Voice for the simulated crowd): {persona['role']}\n"
         f"Age: {persona['age']} | Location: {persona['location']} | Income: {persona['income']}\n"
         f"Marital status: {persona['maritalStatus']}\n"
         f"Cultural background: {persona['culturalBackground']}\n"

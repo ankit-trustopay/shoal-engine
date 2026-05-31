@@ -34,11 +34,27 @@ class DynamicPersona(TypedDict):
     backstory: str
 
 
+ARCHETYPE_LEADER_LABEL = "Archetype Leader"
+KEY_VOICE_LABEL = "Key Voice"
+
+
+def format_archetype_role(base_role: str, persona_id: int) -> str:
+    """UI-facing role: one Key Voice plus Archetype Leaders for the simulated crowd."""
+    base = base_role.strip()
+    lowered = base.lower()
+    if "archetype leader" in lowered or "key voice" in lowered:
+        return base
+    label = KEY_VOICE_LABEL if persona_id == 1 else ARCHETYPE_LEADER_LABEL
+    return f"{base} · {label}"
+
+
 PERSONA_GENERATION_SYSTEM = (
     "You are a market-research persona architect for Shoal AI. "
-    "Given a user dilemma, invent exactly 5 distinct human debaters who would realistically "
-    "care about that topic. Personas must be hyper-localized to geography, industry, and culture "
-    "mentioned in the premise — never generic Western defaults unless the premise is Western.\n\n"
+    "Given a user dilemma, invent exactly 5 Archetype Leaders who represent a much larger "
+    "simulated crowd (typically 1,000 agents). These five are the Key Voices — not the entire swarm, "
+    "but the deepest profiles standing in for the crowd. Personas must be hyper-localized to "
+    "geography, industry, and culture mentioned in the premise — never generic Western defaults "
+    "unless the premise is Western.\n\n"
     "Rules:\n"
     "- If India, Gujarat, or Indian cities appear, use specific Indian cities (e.g. Ahmedabad, Surat, Pune).\n"
     "- If real estate: include stakeholders like landlords, renters, brokers, or first-time buyers.\n"
@@ -47,7 +63,8 @@ PERSONA_GENERATION_SYSTEM = (
     "as market-research vectors (no stereotypes or slurs).\n"
     "- maritalStatus: realistic (e.g. Single, Married, Married with 2 kids, Widowed).\n"
     "- iq and eq: integers 90-140, consistent with education and life story.\n"
-    "- debate_instruction: 2 sentences on how THIS person argues in the debate.\n"
+    "- debate_instruction: 2 sentences on how THIS archetype leader argues for their slice of the crowd.\n"
+    '- role: specific stakeholder title (e.g. "Ahmedabad Landlord") — do NOT append "Archetype Leader" in JSON; we label in post-processing.\n'
     "Return ONLY a JSON array of 5 objects — no markdown."
 )
 
@@ -119,10 +136,12 @@ def _coerce_persona(raw: dict[str, Any], index: int, premise: str) -> DynamicPer
             f"Argue from the perspective of a {role} directly affected by: {premise[:100]}."
         )
 
+    persona_id = index + 1
+
     return {
-        "id": index + 1,
+        "id": persona_id,
         "name": name,
-        "role": role,
+        "role": format_archetype_role(role, persona_id),
         "debate_instruction": debate_instruction,
         "age": _clamp_int(raw.get("age"), 22, 70, 32 + index),
         "location": str(raw.get("location") or "Unknown").strip(),
