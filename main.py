@@ -8,7 +8,7 @@ from typing import Self
 
 from services.dynamic_personas import MAX_DEBATE_AGENTS, clamp_agent_count
 from services.metrics import (
-    compute_confidence_from_sentiments,
+    compute_confidence_from_synthesis,
     compute_extrapolated_votes_from_sentiments,
     compute_swarm_credits,
 )
@@ -120,9 +120,10 @@ async def ignite(payload: IgniteRequest) -> IgniteResponse:
     synthesis = result.manager_synthesis
     sentiments = synthesis.agent_sentiments
 
-    confidence = compute_confidence_from_sentiments(
+    confidence = compute_confidence_from_synthesis(
         sentiments,
         manager_confidence=synthesis.confidence,
+        evidence_quality_score=synthesis.evidence_quality_score,
     )
 
     swarm_size = payload.swarmSize or debate_count

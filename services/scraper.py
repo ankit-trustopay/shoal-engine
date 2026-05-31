@@ -1,4 +1,4 @@
-"""Live web data: Tavily API (primary) → Wikipedia → graceful placeholder."""
+"""Live web data: Tavily API (primary) → deep page fetch → Wikipedia → placeholder."""
 
 from __future__ import annotations
 
@@ -7,14 +7,16 @@ import logging
 import os
 import re
 from typing import Any, TypedDict
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 import requests
+from bs4 import BeautifulSoup
 
 logger = logging.getLogger(__name__)
 
 TAVILY_SEARCH_URL = "https://api.tavily.com/search"
 TAVILY_MAX_RESULTS = 3
+DEEP_FETCH_URL_COUNT = 2
 
 WIKIPEDIA_API_URL = "https://en.wikipedia.org/w/api.php"
 HTTP_HEADERS = {
@@ -22,8 +24,11 @@ HTTP_HEADERS = {
         "Mozilla/5.0 (compatible; ShoalAI-Engine/1.0; +https://shoal.ai)"
     ),
 }
-REQUEST_TIMEOUT_SECONDS = 10
+REQUEST_TIMEOUT_SECONDS = 12
+PAGE_FETCH_TIMEOUT_SECONDS = 15
 MAX_SNIPPET_CHARS = 500
+MAX_EVIDENCE_SNIPPET_CHARS = 1800
+MAX_PAGE_TEXT_CHARS = 4000
 MAX_EVIDENCE_ITEMS = 5
 
 UNAVAILABLE_MESSAGE = "Live web search currently unavailable."
@@ -42,7 +47,7 @@ def _get_tavily_api_key() -> str | None:
 
 
 def _clean_html(text: str) -> str:
-    """Strip HTML tags and decode entities from Wikipedia snippets."""
+    """Strip HTML tags and decode entities."""
     decoded = html.unescape(text)
     without_tags = re.sub(r"<[^>]+>", "", decoded)
     return re.sub(r"\s+", " ", without_tags).strip()
@@ -55,6 +60,103 @@ def _truncate_snippet(text: str, max_chars: int = MAX_SNIPPET_CHARS) -> str:
     return cleaned[: max_chars - 3].rstrip() + "..."
 
 
+def _normalize_whitespace(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _is_fetchable_http_url(url: str) -> bool:
+    try:
+        parsed = urlparse(url.strip())
+    except ValueError:
+        return False
+    return parsed.scheme in ("http", "https") and bool(parsed.netloc)
+
+
+def _extract_page_text(html_content: str) -> str:
+    """Extract readable body text from HTML using BeautifulSoup."""
+    soup = BeautifulSoup(html_content, "html.parser")
+
+    for tag_name in ("script", "style", "noscript", "header", "footer", "nav", "aside", "form"):
+        for tag in soup.find_all(tag_name):
+            tag.decompose()
+
+    main = soup.find("main") or soup.find("article") or soup.body or soup
+    text = main.get_text(separator=" ", strip=True)
+    return _normalize_whitespace(text)
+
+
+def _fetch_url_page_text(url: str) -> str | None:
+    """Fetch and extract text from a single URL."""
+    if not _is_fetchable_http_url(url):
+        return None
+
+    try:
+        response = requests.get(
+            url,
+            headers=HTTP_HEADERS,
+            timeout=PAGE_FETCH_TIMEOUT_SECONDS,
+            allow_redirects=True,
+        )
+    except requests.Timeout:
+        logger.warning("Deep fetch timed out for %s", url)
+        return None
+    except requests.RequestException as exc:
+        logger.warning("Deep fetch failed for %s: %s", url, exc)
+        return None
+
+    if response.status_code != 200:
+        logger.warning("Deep fetch non-200 for %s: status=%s", url, response.status_code)
+        return None
+
+    content_type = (response.headers.get("content-type") or "").lower()
+    if "text/html" not in content_type and "application/xhtml" not in content_type:
+        logger.debug("Skipping non-HTML content at %s (%s)", url, content_type)
+        return None
+
+    text = _extract_page_text(response.text)
+    if len(text) < 120:
+        logger.debug("Deep fetch returned too little text for %s", url)
+        return None
+
+    return _truncate_snippet(text, MAX_PAGE_TEXT_CHARS)
+
+
+def _enrich_evidence_with_deep_fetch(evidence: list[EvidenceItem]) -> list[EvidenceItem]:
+    """Fetch full page text for the top N Tavily URLs."""
+    enriched: list[EvidenceItem] = []
+
+    for index, item in enumerate(evidence):
+        updated: EvidenceItem = {
+            "title": item["title"],
+            "source": item["source"],
+            "url": item["url"],
+            "snippet": item["snippet"],
+        }
+
+        if index < DEEP_FETCH_URL_COUNT:
+            page_text = _fetch_url_page_text(item["url"])
+            if page_text:
+                combined = (
+                    f"Search preview: {item['snippet']}\n\n"
+                    f"Deep page extract:\n{page_text}"
+                )
+                updated["snippet"] = _truncate_snippet(
+                    combined,
+                    MAX_EVIDENCE_SNIPPET_CHARS,
+                )
+                updated["source"] = "Web (Tavily + Deep Fetch)"
+                logger.info(
+                    "Deep fetch enriched evidence [%s] %s (%s chars)",
+                    index + 1,
+                    item["url"][:80],
+                    len(page_text),
+                )
+
+        enriched.append(updated)
+
+    return enriched
+
+
 def _wikipedia_article_url(title: str) -> str:
     slug = quote(title.replace(" ", "_"), safe="/")
     return f"https://en.wikipedia.org/wiki/{slug}"
@@ -63,7 +165,13 @@ def _wikipedia_article_url(title: str) -> str:
 def _format_context_from_evidence(items: list[EvidenceItem]) -> str:
     chunks: list[str] = []
     for index, item in enumerate(items, start=1):
-        chunks.append(f"[{index}] {item['title']}\n{item['snippet']}".strip())
+        chunks.append(
+            (
+                f"[Source {index}] {item['title']}\n"
+                f"URL: {item['url']}\n"
+                f"{item['snippet']}"
+            ).strip(),
+        )
     return "\n\n".join(chunks)
 
 
@@ -93,17 +201,16 @@ def _map_tavily_results(results: list[Any]) -> list[EvidenceItem]:
 
 
 def _fetch_tavily_evidence(query: str) -> list[EvidenceItem]:
-    """Tier 1: Tavily real-time search API."""
+    """Tier 1: Tavily real-time search API + deep fetch on top URLs."""
     api_key = _get_tavily_api_key()
     if not api_key:
         logger.warning("TAVILY_API_KEY is not set; skipping Tavily search")
-        print("TAVILY_API_KEY missing; skipping Tavily tier")
         return []
 
     payload = {
         "api_key": api_key,
         "query": query,
-        "search_depth": "basic",
+        "search_depth": "advanced",
         "include_answer": False,
         "max_results": TAVILY_MAX_RESULTS,
     }
@@ -117,11 +224,9 @@ def _fetch_tavily_evidence(query: str) -> list[EvidenceItem]:
         )
     except requests.Timeout as exc:
         logger.warning("Tavily request timed out: %s", exc)
-        print(f"Tavily timeout: {exc}")
         return []
     except requests.RequestException as exc:
         logger.warning("Tavily request failed: %s", exc)
-        print(f"Tavily request failed: {exc}")
         return []
 
     if response.status_code != 200:
@@ -131,30 +236,30 @@ def _fetch_tavily_evidence(query: str) -> list[EvidenceItem]:
             response.status_code,
             body_preview,
         )
-        print(f"Tavily non-200: status={response.status_code}")
         return []
 
     try:
         data: dict[str, Any] = response.json()
     except ValueError as exc:
         logger.warning("Tavily invalid JSON: %s", exc)
-        print(f"Tavily invalid JSON: {exc}")
         return []
 
     results = data.get("results", [])
     if not isinstance(results, list) or not results:
         logger.info("Tavily returned no results for query '%s'", query[:80])
-        print("Tavily returned no results")
         return []
 
     evidence = _map_tavily_results(results)
-    if evidence:
-        logger.info(
-            "Tavily success for query '%s' (%s items)",
-            query[:80],
-            len(evidence),
-        )
-        print(f"Tavily succeeded ({len(evidence)} evidence items)")
+    if not evidence:
+        return []
+
+    evidence = _enrich_evidence_with_deep_fetch(evidence)
+    logger.info(
+        "Tavily success for query '%s' (%s items, deep fetch on top %s)",
+        query[:80],
+        len(evidence),
+        min(DEEP_FETCH_URL_COUNT, len(evidence)),
+    )
     return evidence
 
 
@@ -177,25 +282,21 @@ def _fetch_wikipedia_evidence(query: str) -> list[EvidenceItem]:
             timeout=REQUEST_TIMEOUT_SECONDS,
         )
     except requests.RequestException as exc:
-        print(f"Wikipedia request failed: {exc}")
         logger.warning("Wikipedia request failed: %s", exc)
         return []
 
     if response.status_code != 200:
-        print(f"Wikipedia non-200: status={response.status_code}")
         logger.warning("Wikipedia non-200: status=%s", response.status_code)
         return []
 
     try:
         payload: dict[str, Any] = response.json()
     except ValueError as exc:
-        print(f"Wikipedia invalid JSON: {exc}")
         logger.warning("Wikipedia invalid JSON: %s", exc)
         return []
 
     search_results = payload.get("query", {}).get("search", [])
     if not isinstance(search_results, list) or not search_results:
-        print("Wikipedia returned no search results")
         return []
 
     evidence: list[EvidenceItem] = []
@@ -216,12 +317,8 @@ def _fetch_wikipedia_evidence(query: str) -> list[EvidenceItem]:
         )
 
     if evidence:
-        print(f"Wikipedia succeeded ({len(evidence)} evidence items)")
         logger.info("Wikipedia success for query '%s'", query[:80])
-        return evidence
-
-    print("Wikipedia results had no usable snippets")
-    return []
+    return evidence
 
 
 def _fallback_evidence(query: str) -> list[EvidenceItem]:
@@ -244,35 +341,30 @@ def _fallback_evidence(query: str) -> list[EvidenceItem]:
 def scrape_for_premise(query: str) -> tuple[str, list[EvidenceItem]]:
     """
     Fetch live context and structured evidence for a premise.
-    Tier 1: Tavily → Tier 2: Wikipedia → minimal placeholder.
+    Tier 1: Tavily (+ deep page fetch) → Tier 2: Wikipedia → placeholder.
     """
     trimmed = query.strip()
     if not trimmed:
-        print("scrape_for_premise called with empty query")
         logger.warning("scrape_for_premise called with empty query")
         return UNAVAILABLE_MESSAGE, []
 
-    print(f"scrape_for_premise starting for query: {trimmed[:120]}")
-    logger.info("Starting Tavily-first search for: %s", trimmed[:120])
+    logger.info("Starting deep Tavily-first search for: %s", trimmed[:120])
 
     try:
         tavily_evidence = _fetch_tavily_evidence(trimmed)
         if tavily_evidence:
             return _format_context_from_evidence(tavily_evidence), tavily_evidence
-    except Exception as exc:
-        print(f"Tavily tier raised unexpected error: {exc}")
+    except Exception:
         logger.exception("Tavily tier unexpected error")
 
-    print("Tavily unavailable or failed, falling back to Wikipedia...")
+    logger.info("Tavily unavailable or failed, falling back to Wikipedia...")
     try:
         wiki_evidence = _fetch_wikipedia_evidence(trimmed)
         if wiki_evidence:
             return _format_context_from_evidence(wiki_evidence), wiki_evidence
-    except Exception as exc:
-        print(f"Wikipedia tier raised unexpected error: {exc}")
+    except Exception:
         logger.exception("Wikipedia tier unexpected error")
 
-    print("All search tiers failed; returning graceful fallback context")
     logger.error("All scraper tiers failed for query '%s'", trimmed[:80])
     fallback = _fallback_evidence(trimmed)
     return _format_context_from_evidence(fallback), fallback

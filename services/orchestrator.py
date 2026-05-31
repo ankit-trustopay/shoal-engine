@@ -40,7 +40,7 @@ async def run_swarm_ignite(
     model: str | None = None,
 ) -> SwarmIgniteResult:
     """
-    Execute web search, adversarial persona generation, parallel debate, and manager consensus.
+    Execute deep research, adversarial persona generation, reflective debate, and synthesis.
     """
     client = get_client()
     trimmed_premise = premise.strip()

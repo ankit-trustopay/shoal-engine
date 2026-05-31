@@ -4,3 +4,4 @@ pydantic
 openai
 python-dotenv
 requests
+beautifulsoup4

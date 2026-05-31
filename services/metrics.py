@@ -79,24 +79,49 @@ def score_text_sentiment(text: str) -> float:
     return max(-1.0, min(1.0, raw))
 
 
+def compute_confidence_from_synthesis(
+    sentiments: list[AgentSentiment],
+    manager_confidence: int | None = None,
+    evidence_quality_score: int | None = None,
+) -> int:
+    """
+    Blend manager confidence with sentiment alignment and evidence quality.
+
+    The manager must weigh both how aligned agents are and how well they cited
+    verifiable data from the research context.
+    """
+    if manager_confidence is not None:
+        base = max(75, min(95, int(manager_confidence)))
+    elif sentiments:
+        total = len(sentiments)
+        for_count = sum(1 for item in sentiments if item == "For")
+        against_count = sum(1 for item in sentiments if item == "Against")
+        dominant = max(for_count, against_count, total - for_count - against_count)
+        agreement_ratio = dominant / total
+        base = max(75, min(95, 75 + int(round(agreement_ratio * 20))))
+    else:
+        base = 75
+
+    if evidence_quality_score is None:
+        return base
+
+    quality = max(0, min(100, int(evidence_quality_score)))
+    blended = int(round(0.55 * base + 0.45 * max(75, quality)))
+
+    if quality < 60:
+        blended = min(blended, 82)
+    if quality < 45:
+        blended = min(blended, 78)
+
+    return max(75, min(95, blended))
+
+
 def compute_confidence_from_sentiments(
     sentiments: list[AgentSentiment],
     manager_confidence: int | None = None,
 ) -> int:
-    """Derive confidence from the dominant sentiment bloc, with optional manager override."""
-    if manager_confidence is not None:
-        return max(75, min(95, int(manager_confidence)))
-
-    if not sentiments:
-        return 75
-
-    total = len(sentiments)
-    for_count = sum(1 for item in sentiments if item == "For")
-    against_count = sum(1 for item in sentiments if item == "Against")
-    dominant = max(for_count, against_count, total - for_count - against_count)
-    agreement_ratio = dominant / total
-    score = 75 + int(round(agreement_ratio * 20))
-    return max(75, min(95, score))
+    """Backward-compatible confidence helper."""
+    return compute_confidence_from_synthesis(sentiments, manager_confidence, None)
 
 
 def compute_extrapolated_votes_from_sentiments(

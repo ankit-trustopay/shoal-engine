@@ -46,6 +46,7 @@ class ManagerSynthesis:
     recommended_actions: list[RecommendedAction] = field(default_factory=list)
     minority_dissent: str = ""
     confidence: int = 75
+    evidence_quality_score: int = 75
 
 
 def build_manager_system(agent_count: int) -> str:
@@ -65,6 +66,14 @@ def build_manager_system(agent_count: int) -> str:
         '"For", "Against", or "Neutral".\n'
         "- Classify strictly from each agent's stated position relative to the premise — not your synthesis.\n"
         "- Use the exact agent role labels provided in the user message.\n\n"
+        "EVIDENCE QUALITY & CONFIDENCE (mandatory):\n"
+        "- Score how well agents used specific, verifiable data from the web context "
+        "(metrics, dates, named sources, causal mechanisms).\n"
+        "- Penalize vague rhetoric, uncited claims, or ignoring available deep research.\n"
+        "- evidenceQualityScore (0-100): overall panel evidence quality independent of sentiment.\n"
+        "- confidence (75-95): must reflect BOTH sentiment alignment AND evidenceQualityScore.\n"
+        "  * Unanimous sentiment with weak evidence (evidenceQualityScore < 60) must not exceed 82.\n"
+        "  * Strong evidence with split sentiment may still reach 85+ if citations are concrete.\n\n"
         "OUTPUT (valid JSON only — no markdown fences, no commentary):\n"
         "{\n"
         '  "consensus": "<final institutional consensus; obey premise formatting constraints>",\n'
@@ -75,7 +84,8 @@ def build_manager_system(agent_count: int) -> str:
         '    {"step": 1, "title": "<short imperative>", "body": "<specific actionable detail>"}\n'
         "  ],\n"
         '  "minorityDissent": "<1-2 sentences summarizing the strongest opposing argument; empty string if unanimous>",\n'
-        '  "confidence": <integer 75-95 reflecting consensus strength given the sentiment split>\n'
+        '  "evidenceQualityScore": <integer 0-100>,\n'
+        '  "confidence": <integer 75-95; blend sentiment + evidence quality>\n'
         "}\n\n"
         "recommendedActions: provide 2-3 highly specific steps grounded in consensus and evidence.\n"
         "minorityDissent: distill the strongest counter-argument from Against/Neutral agents."
@@ -203,12 +213,20 @@ def parse_manager_synthesis_payload(
         else 75
     )
 
+    quality_raw = payload.get("evidenceQualityScore") or payload.get("evidence_quality_score")
+    evidence_quality_score = (
+        int(quality_raw)
+        if isinstance(quality_raw, (int, float))
+        else 75
+    )
+
     return ManagerSynthesis(
         consensus=consensus,
         agent_sentiments=agent_sentiments,
         recommended_actions=recommended_actions,
         minority_dissent=minority_dissent,
         confidence=max(75, min(95, confidence)),
+        evidence_quality_score=max(0, min(100, evidence_quality_score)),
     )
 
 
@@ -237,6 +255,51 @@ def format_persona_system_prompt(
     )
 
 
+async def _chat_completion(
+    client: AsyncOpenAI,
+    model: str,
+    system_prompt: str,
+    user_prompt: str,
+    temperature: float,
+) -> str:
+    completion = await client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        temperature=temperature,
+    )
+    return (completion.choices[0].message.content or "").strip()
+
+
+def _build_reflection_critique_prompt(persona: dict, draft: str) -> str:
+    role = persona.get("role") or "Agent"
+    stance = persona.get("adversarial_stance") or persona.get("debate_instruction") or ""
+
+    return (
+        f"You wrote this DRAFT argument:\n{draft}\n\n"
+        f"Your assigned adversarial role: {role}\n"
+        f"Mandated stance: {stance}\n\n"
+        "Critique your draft ruthlessly as an internal red-team reviewer:\n"
+        "- Am I defending my mandated stance aggressively enough?\n"
+        "- Did I cite specific metrics, dates, or facts from the web data — not generic claims?\n"
+        "- Did I anticipate and attack the opposing archetypes?\n"
+        "- Is there hedging, vagueness, or missing evidence I must fix?\n\n"
+        "Respond with 3-5 bullet critiques only. Be harsh and specific."
+    )
+
+
+def _build_reflection_final_prompt(draft: str, critique: str) -> str:
+    return (
+        f"DRAFT:\n{draft}\n\n"
+        f"SELF-CRITIQUE:\n{critique}\n\n"
+        "Revise into your FINAL argument.\n"
+        "Output ONLY the final text: exactly 2 sentences of aggressive, evidence-dense "
+        "institutional prose. No labels, bullets, or preamble."
+    )
+
+
 async def get_persona_debate_response(
     client: AsyncOpenAI,
     persona: dict,
@@ -245,26 +308,53 @@ async def get_persona_debate_response(
     model: str,
     opposing_roles: list[str],
 ) -> dict[str, str]:
-    """Run one adversarial debate turn for a persona."""
+    """
+    Run an adversarial debate turn with draft → self-critique → final reflection loop.
+    """
     role_name = str(persona.get("role") or persona.get("name") or "Agent")
     resolved_model = resolve_openrouter_model(model)
     system_prompt = (
         f"{format_persona_system_prompt(persona, opposing_roles)}\n\n"
-        f"Live web data:\n{web_data}"
+        f"Live web data (includes deep page extracts where available):\n{web_data}"
     )
 
+    premise_block = f"User premise:\n{user_message.strip()}"
+
     try:
-        completion = await client.chat.completions.create(
-            model=resolved_model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_message},
-            ],
-            temperature=0.55,
+        draft = await _chat_completion(
+            client,
+            resolved_model,
+            system_prompt,
+            (
+                f"{premise_block}\n\n"
+                "STEP 1 — DRAFT: Write your initial argument in exactly 2 sentences. "
+                "Cite specific data from the web context."
+            ),
+            temperature=0.6,
         )
+
+        critique = await _chat_completion(
+            client,
+            resolved_model,
+            system_prompt,
+            _build_reflection_critique_prompt(persona, draft),
+            temperature=0.35,
+        )
+
+        final_text = await _chat_completion(
+            client,
+            resolved_model,
+            system_prompt,
+            _build_reflection_final_prompt(draft, critique),
+            temperature=0.45,
+        )
+
+        if not final_text:
+            final_text = draft
+
     except Exception as exc:
         logger.exception(
-            "OpenRouter error for persona %s (model=%s)",
+            "OpenRouter reflection loop failed for %s (model=%s)",
             role_name,
             resolved_model,
         )
@@ -273,15 +363,14 @@ async def get_persona_debate_response(
             detail=f"Failed to generate response for {role_name}",
         ) from exc
 
-    response_text = (completion.choices[0].message.content or "").strip()
     logger.info(
-        "Adversarial response for %s via %s (%s chars)",
+        "Adversarial reflection complete for %s via %s (final=%s chars)",
         role_name,
         resolved_model,
-        len(response_text),
+        len(final_text),
     )
 
-    return {"role": role_name, "text": response_text}
+    return {"role": role_name, "text": final_text}
 
 
 async def get_manager_synthesis(
@@ -299,9 +388,10 @@ async def get_manager_synthesis(
 
     user_message = (
         f"User premise:\n{premise.strip()}\n\n"
-        f"Live web data:\n{web_data}\n\n"
+        f"Live web data (includes deep page extracts where available):\n{web_data}\n\n"
         f"{agent_count} adversarial agent perspectives "
-        "(classify each sentiment strictly from these texts):\n"
+        "(classify each sentiment strictly from these texts; score evidence quality "
+        "against the web data above, not agent rhetoric alone):\n"
         f"{combined_perspectives}\n\n"
         "Return JSON only."
     )
@@ -328,9 +418,11 @@ async def get_manager_synthesis(
 
     if parsed is not None:
         logger.info(
-            "Manager synthesis via %s: sentiments=%s actions=%s",
+            "Manager synthesis via %s: sentiments=%s evidenceQuality=%s confidence=%s actions=%s",
             resolved_model,
             parsed.agent_sentiments,
+            parsed.evidence_quality_score,
+            parsed.confidence,
             len(parsed.recommended_actions),
         )
         return parsed
@@ -360,4 +452,5 @@ async def get_manager_synthesis(
         recommended_actions=[],
         minority_dissent="",
         confidence=75,
+        evidence_quality_score=60,
     )
