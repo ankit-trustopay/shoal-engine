@@ -1,8 +1,9 @@
+import asyncio
 import os
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
-from openai import OpenAI
+from openai import AsyncOpenAI
 from pydantic import BaseModel, Field
 
 load_dotenv()
@@ -11,16 +12,33 @@ app = FastAPI(title="Shoal AI Engine", version="0.1.0")
 
 MODEL = "deepseek/deepseek-chat"
 
-SKEPTIC_SYSTEM = (
-    "You are a Skeptic. Challenge the user's premise in 2 sentences."
-)
-EXPERT_SYSTEM = (
-    "You are a Domain Expert. Read the Skeptic's argument and counter it "
-    "with hard facts in 2 sentences."
-)
 MANAGER_SYSTEM = (
-    "You are the Manager. Synthesize the debate and give a final 2-sentence verdict."
+    "You are the Manager. Read these 5 agent perspectives and provide a "
+    "final 2-sentence definitive verdict."
 )
+
+PERSONAS: list[tuple[str, str]] = [
+    (
+        "Financial Skeptic",
+        "Challenge the financial viability of the premise in 2 sentences.",
+    ),
+    (
+        "Domain Expert",
+        "Provide technical/historical facts about the premise in 2 sentences.",
+    ),
+    (
+        "Risk Analyst",
+        "Identify the biggest tail-risk or downside of the premise in 2 sentences.",
+    ),
+    (
+        "Consumer Voice",
+        "Explain how average people or end-users will react to this in 2 sentences.",
+    ),
+    (
+        "Optimist",
+        "Highlight the massive upside and bullish case for this premise in 2 sentences.",
+    ),
+]
 
 
 class IgniteRequest(BaseModel):
@@ -39,36 +57,44 @@ class IgniteResponse(BaseModel):
     messages: list[DebateMessage]
 
 
-def get_client() -> OpenAI:
+def get_client() -> AsyncOpenAI:
     api_key = os.getenv("OPENROUTER_API_KEY")
     if not api_key:
         raise HTTPException(
             status_code=500,
             detail="OPENROUTER_API_KEY is not configured",
         )
-    return OpenAI(
+    return AsyncOpenAI(
         base_url="https://openrouter.ai/api/v1",
         api_key=api_key,
     )
 
 
-def call_agent(client: OpenAI, system_prompt: str, user_prompt: str) -> str:
+async def get_agent_response(
+    client: AsyncOpenAI,
+    role_name: str,
+    system_prompt: str,
+    user_message: str,
+) -> dict[str, str]:
     try:
-        completion = client.chat.completions.create(
+        completion = await client.chat.completions.create(
             model=MODEL,
             messages=[
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
+                {"role": "user", "content": user_message},
             ],
         )
     except Exception as exc:
-        print("[ignite] OpenRouter error:", exc)
+        print(f"[ignite] OpenRouter error ({role_name}):", exc)
         raise HTTPException(
             status_code=502,
-            detail="Failed to generate AI response",
+            detail=f"Failed to generate response for {role_name}",
         ) from exc
 
-    return (completion.choices[0].message.content or "").strip()
+    response_text = (completion.choices[0].message.content or "").strip()
+    print(f"[ignite] {role_name}:\n{response_text}\n")
+
+    return {"role": role_name, "text": response_text}
 
 
 @app.get("/health")
@@ -77,34 +103,44 @@ def health() -> dict[str, str]:
 
 
 @app.post("/ignite", response_model=IgniteResponse)
-def ignite(payload: IgniteRequest) -> IgniteResponse:
+async def ignite(payload: IgniteRequest) -> IgniteResponse:
     client = get_client()
     premise = payload.premise.strip()
 
-    print(f"[ignite] Starting multi-agent debate for swarm {payload.swarmId}")
-
-    skeptic_text = call_agent(client, SKEPTIC_SYSTEM, premise)
-    print(f"[ignite] Skeptic:\n{skeptic_text}")
-
-    expert_user = (
-        f"User premise:\n{premise}\n\n"
-        f"Skeptic's argument:\n{skeptic_text}"
+    print(
+        f"[ignite] Starting parallel orchestration for swarm {payload.swarmId}",
     )
-    expert_text = call_agent(client, EXPERT_SYSTEM, expert_user)
-    print(f"[ignite] Expert:\n{expert_text}")
 
+    agent_tasks = [
+        get_agent_response(
+            client,
+            role_name,
+            f"You are a {role_name}. {instruction}",
+            premise,
+        )
+        for role_name, instruction in PERSONAS
+    ]
+
+    agent_results = await asyncio.gather(*agent_tasks)
+
+    combined_perspectives = "\n\n".join(
+        f"{msg['role']}:\n{msg['text']}" for msg in agent_results
+    )
     manager_user = (
         f"User premise:\n{premise}\n\n"
-        f"Skeptic:\n{skeptic_text}\n\n"
-        f"Expert:\n{expert_text}"
+        f"Agent perspectives:\n{combined_perspectives}"
     )
-    manager_text = call_agent(client, MANAGER_SYSTEM, manager_user)
-    print(f"[ignite] Manager:\n{manager_text}")
+
+    manager_result = await get_agent_response(
+        client,
+        "Manager",
+        MANAGER_SYSTEM,
+        manager_user,
+    )
 
     messages = [
-        DebateMessage(role="Skeptic", text=skeptic_text),
-        DebateMessage(role="Expert", text=expert_text),
-        DebateMessage(role="Manager", text=manager_text),
+        DebateMessage(role=msg["role"], text=msg["text"])
+        for msg in [*agent_results, manager_result]
     ]
 
     return IgniteResponse(
