@@ -7,11 +7,7 @@ from pydantic import BaseModel, Field, model_validator
 from typing import Self
 
 from services.dynamic_personas import MAX_DEBATE_AGENTS, clamp_agent_count
-from services.metrics import (
-    compute_confidence_from_synthesis,
-    compute_extrapolated_votes_from_sentiments,
-    compute_swarm_credits,
-)
+from services.metrics import compute_strict_confidence, compute_swarm_credits
 from services.orchestrator import run_swarm_ignite
 from services.webhook_notify import notify_swarm_failure
 
@@ -75,6 +71,13 @@ class RecommendedActionPayload(BaseModel):
     body: str = Field(..., min_length=1)
 
 
+class DebateTranscriptEntryPayload(BaseModel):
+    agentName: str = Field(..., min_length=1)
+    role: str = Field(..., min_length=1)
+    text: str = Field(..., min_length=1)
+    timestamp: str = Field(..., min_length=1)
+
+
 class IgniteResponse(BaseModel):
     status: str
     swarmId: str
@@ -92,6 +95,7 @@ class IgniteResponse(BaseModel):
     model: str | None = None
     recommendedActions: list[RecommendedActionPayload] = Field(default_factory=list)
     minorityDissent: str | None = None
+    debateTranscript: list[DebateTranscriptEntryPayload] = Field(default_factory=list)
 
 
 def _failure_message(exc: Exception) -> str:
@@ -138,17 +142,21 @@ async def ignite(payload: IgniteRequest) -> IgniteResponse:
 
         synthesis = result.manager_synthesis
         sentiments = synthesis.agent_sentiments
-
-        confidence = compute_confidence_from_synthesis(
-            sentiments,
-            manager_confidence=synthesis.confidence,
-            evidence_quality_score=synthesis.evidence_quality_score,
-        )
-
         swarm_size = payload.swarmSize or debate_count
-        votes_for, votes_against, votes_neutral = compute_extrapolated_votes_from_sentiments(
+
+        confidence, votes_for, votes_against, votes_neutral = compute_strict_confidence(
+            synthesis.consensus,
             sentiments,
             swarm_size=swarm_size,
+        )
+
+        logger.info(
+            "Swarm %s strict confidence=%s votes=%s/%s/%s (consensus-aligned)",
+            payload.swarmId,
+            confidence,
+            votes_for,
+            votes_against,
+            votes_neutral,
         )
 
         executed_agents = result.executed_agent_count
@@ -194,6 +202,16 @@ async def ignite(payload: IgniteRequest) -> IgniteResponse:
             for profile in result.agent_profiles
         ]
 
+        debate_transcript = [
+            DebateTranscriptEntryPayload(
+                agentName=entry.agentName,
+                role=entry.role,
+                text=entry.text,
+                timestamp=entry.timestamp,
+            )
+            for entry in result.debate_transcript
+        ]
+
         return IgniteResponse(
             status="Swarm ignited",
             swarmId=payload.swarmId,
@@ -211,6 +229,7 @@ async def ignite(payload: IgniteRequest) -> IgniteResponse:
             model=payload.model,
             recommendedActions=recommended_actions,
             minorityDissent=minority_dissent,
+            debateTranscript=debate_transcript,
         )
     except HTTPException as exc:
         if exc.status_code >= 500:

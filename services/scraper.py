@@ -15,8 +15,10 @@ from bs4 import BeautifulSoup
 logger = logging.getLogger(__name__)
 
 TAVILY_SEARCH_URL = "https://api.tavily.com/search"
-TAVILY_MAX_RESULTS = 3
-DEEP_FETCH_URL_COUNT = 2
+MIN_EVIDENCE_ITEMS = 4
+MAX_EVIDENCE_ITEMS = 10
+MAX_DYNAMIC_QUERIES = 4
+DEEP_FETCH_URL_COUNT = 4
 
 WIKIPEDIA_API_URL = "https://en.wikipedia.org/w/api.php"
 HTTP_HEADERS = {
@@ -29,7 +31,6 @@ PAGE_FETCH_TIMEOUT_SECONDS = 15
 MAX_SNIPPET_CHARS = 500
 MAX_EVIDENCE_SNIPPET_CHARS = 1800
 MAX_PAGE_TEXT_CHARS = 4000
-MAX_EVIDENCE_ITEMS = 5
 
 UNAVAILABLE_MESSAGE = "Live web search currently unavailable."
 
@@ -175,8 +176,13 @@ def _format_context_from_evidence(items: list[EvidenceItem]) -> str:
     return "\n\n".join(chunks)
 
 
-def _map_tavily_results(results: list[Any]) -> list[EvidenceItem]:
+def _map_tavily_results(
+    results: list[Any],
+    *,
+    max_results: int,
+) -> list[EvidenceItem]:
     evidence: list[EvidenceItem] = []
+    limit = max(1, min(max_results, MAX_EVIDENCE_ITEMS))
 
     for result in results:
         if not isinstance(result, dict):
@@ -194,14 +200,58 @@ def _map_tavily_results(results: list[Any]) -> list[EvidenceItem]:
                 "snippet": snippet,
             },
         )
-        if len(evidence) >= TAVILY_MAX_RESULTS:
+        if len(evidence) >= limit:
             break
 
     return evidence
 
 
-def _fetch_tavily_evidence(query: str) -> list[EvidenceItem]:
-    """Tier 1: Tavily real-time search API + deep fetch on top URLs."""
+def _generate_dynamic_queries(premise: str) -> list[tuple[str, int]]:
+    """
+    Build multiple premise-specific search queries targeting 4–10 unique sources.
+    """
+    base = premise.strip()
+    if not base:
+        return []
+
+    candidates: list[str] = [base[:400]]
+
+    core = re.sub(
+        r"^(should|will|is|are|what|how|when|why|can|could)\s+",
+        "",
+        base,
+        flags=re.IGNORECASE,
+    ).strip(" ?.")
+
+    if len(core) >= 12:
+        candidates.append(f"{core[:280]} financial metrics revenue market data")
+        candidates.append(f"{core[:280]} risks regulatory compliance analysis")
+        if "?" in base or re.search(r"\b(should|whether|or)\b", base, re.IGNORECASE):
+            candidates.append(f"{core[:280]} case studies outcomes benchmarks")
+
+    unique: list[str] = []
+    seen: set[str] = set()
+    for query in candidates:
+        key = query.lower()[:160]
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(query)
+
+    unique = unique[:MAX_DYNAMIC_QUERIES]
+    query_count = max(1, len(unique))
+    per_query = max(2, (MAX_EVIDENCE_ITEMS + query_count - 1) // query_count)
+
+    return [(query, min(per_query, 5)) for query in unique]
+
+
+def _fetch_tavily_evidence(
+    query: str,
+    *,
+    max_results: int = 3,
+    deep_fetch: bool = True,
+) -> list[EvidenceItem]:
+    """Tier 1: Tavily real-time search API; optional deep fetch on top URLs."""
     api_key = _get_tavily_api_key()
     if not api_key:
         logger.warning("TAVILY_API_KEY is not set; skipping Tavily search")
@@ -212,7 +262,7 @@ def _fetch_tavily_evidence(query: str) -> list[EvidenceItem]:
         "query": query,
         "search_depth": "advanced",
         "include_answer": False,
-        "max_results": TAVILY_MAX_RESULTS,
+        "max_results": max(1, min(int(max_results), 10)),
     }
 
     try:
@@ -249,17 +299,24 @@ def _fetch_tavily_evidence(query: str) -> list[EvidenceItem]:
         logger.info("Tavily returned no results for query '%s'", query[:80])
         return []
 
-    evidence = _map_tavily_results(results)
+    evidence = _map_tavily_results(results, max_results=max_results)
     if not evidence:
         return []
 
-    evidence = _enrich_evidence_with_deep_fetch(evidence)
-    logger.info(
-        "Tavily success for query '%s' (%s items, deep fetch on top %s)",
-        query[:80],
-        len(evidence),
-        min(DEEP_FETCH_URL_COUNT, len(evidence)),
-    )
+    if deep_fetch:
+        evidence = _enrich_evidence_with_deep_fetch(evidence)
+        logger.info(
+            "Tavily success for query '%s' (%s items, deep fetch on top %s)",
+            query[:80],
+            len(evidence),
+            min(DEEP_FETCH_URL_COUNT, len(evidence)),
+        )
+    else:
+        logger.info(
+            "Tavily success for query '%s' (%s items, deep fetch deferred)",
+            query[:80],
+            len(evidence),
+        )
     return evidence
 
 
@@ -338,22 +395,90 @@ def _fallback_evidence(query: str) -> list[EvidenceItem]:
     ]
 
 
+def _collect_tavily_evidence_dynamic(premise: str) -> list[EvidenceItem]:
+    """Run multiple dynamic Tavily queries; dedupe URLs; target 4–10 sources."""
+    query_plan = _generate_dynamic_queries(premise)
+    if not query_plan:
+        return []
+
+    seen_urls: set[str] = set()
+    evidence: list[EvidenceItem] = []
+
+    for search_query, batch_max in query_plan:
+        if len(evidence) >= MAX_EVIDENCE_ITEMS:
+            break
+
+        remaining = MAX_EVIDENCE_ITEMS - len(evidence)
+        try:
+            batch = _fetch_tavily_evidence(
+                search_query,
+                max_results=min(batch_max, remaining),
+                deep_fetch=False,
+            )
+        except Exception:
+            logger.exception("Tavily batch failed for query '%s'", search_query[:80])
+            continue
+
+        for item in batch:
+            url_key = item["url"].strip().lower()
+            if not url_key or url_key in seen_urls:
+                continue
+            seen_urls.add(url_key)
+            evidence.append(item)
+            if len(evidence) >= MAX_EVIDENCE_ITEMS:
+                break
+
+    if len(evidence) >= MIN_EVIDENCE_ITEMS:
+        deep_count = min(DEEP_FETCH_URL_COUNT, len(evidence))
+        return _enrich_evidence_with_deep_fetch(evidence[:MAX_EVIDENCE_ITEMS])
+
+    return evidence
+
+
 def scrape_for_premise(query: str) -> tuple[str, list[EvidenceItem]]:
     """
     Fetch live context and structured evidence for a premise.
-    Tier 1: Tavily (+ deep page fetch) → Tier 2: Wikipedia → placeholder.
+    Tier 1: multi-query Tavily (+ deep page fetch) → Tier 2: Wikipedia → placeholder.
     """
     trimmed = query.strip()
     if not trimmed:
         logger.warning("scrape_for_premise called with empty query")
         return UNAVAILABLE_MESSAGE, []
 
-    logger.info("Starting deep Tavily-first search for: %s", trimmed[:120])
+    logger.info(
+        "Starting dynamic Tavily search (%s–%s sources) for: %s",
+        MIN_EVIDENCE_ITEMS,
+        MAX_EVIDENCE_ITEMS,
+        trimmed[:120],
+    )
 
     try:
-        tavily_evidence = _fetch_tavily_evidence(trimmed)
-        if tavily_evidence:
+        tavily_evidence = _collect_tavily_evidence_dynamic(trimmed)
+        if len(tavily_evidence) >= MIN_EVIDENCE_ITEMS:
+            logger.info(
+                "Dynamic Tavily gathered %s sources for premise",
+                len(tavily_evidence),
+            )
             return _format_context_from_evidence(tavily_evidence), tavily_evidence
+
+        if tavily_evidence:
+            logger.info(
+                "Partial Tavily results (%s); supplementing with single-query fetch",
+                len(tavily_evidence),
+            )
+            extra = _fetch_tavily_evidence(trimmed, max_results=MAX_EVIDENCE_ITEMS)
+            seen = {item["url"].lower() for item in tavily_evidence}
+            for item in extra:
+                if item["url"].lower() not in seen:
+                    tavily_evidence.append(item)
+                    seen.add(item["url"].lower())
+                if len(tavily_evidence) >= MIN_EVIDENCE_ITEMS:
+                    break
+            if len(tavily_evidence) >= MIN_EVIDENCE_ITEMS:
+                enriched = _enrich_evidence_with_deep_fetch(
+                    tavily_evidence[:MAX_EVIDENCE_ITEMS],
+                )
+                return _format_context_from_evidence(enriched), enriched
     except Exception:
         logger.exception("Tavily tier unexpected error")
 

@@ -25,6 +25,9 @@ _POSITIVE_TERMS = (
     "clear winner",
     "proceed",
     "yes",
+    "approve",
+    "expand",
+    "invest",
 )
 
 _NEGATIVE_TERMS = (
@@ -42,6 +45,9 @@ _NEGATIVE_TERMS = (
     "recall",
     "warning",
     "no",
+    "reject",
+    "delay",
+    "halt",
 )
 
 
@@ -71,49 +77,102 @@ def score_text_sentiment(text: str) -> float:
     neg = sum(1 for term in _NEGATIVE_TERMS if term in lowered)
 
     if pos == 0 and neg == 0:
-        if re.search(r"\b(should|will|best option|consensus)\b", lowered):
+        if re.search(r"\b(should|will|best option|consensus|proceed|approve)\b", lowered):
             return 0.25
+        if re.search(r"\b(should not|avoid|reject|delay|do not)\b", lowered):
+            return -0.25
         return 0.0
 
     raw = (pos - neg) / (pos + neg)
     return max(-1.0, min(1.0, raw))
 
 
+def infer_consensus_alignment(
+    consensus: str,
+    sentiments: list[AgentSentiment],
+) -> AgentSentiment:
+    """
+    Determine which vote bucket the manager's written consensus aligns with.
+    Used for strict confidence = (aligned_votes / total_votes) * 100.
+    """
+    score = score_text_sentiment(consensus)
+
+    if score >= 0.2:
+        return "For"
+    if score <= -0.2:
+        return "Against"
+
+    for_count = sum(1 for item in sentiments if item == "For")
+    against_count = sum(1 for item in sentiments if item == "Against")
+    neutral_count = sum(1 for item in sentiments if item == "Neutral")
+
+    if for_count > against_count and for_count >= neutral_count:
+        return "For"
+    if against_count > for_count and against_count >= neutral_count:
+        return "Against"
+    return "Neutral"
+
+
+def compute_strict_confidence(
+    consensus: str,
+    sentiments: list[AgentSentiment],
+    swarm_size: int = DEFAULT_SWARM_SIZE,
+) -> tuple[int, int, int, int]:
+    """
+    Algorithmic confidence from vote distribution and consensus alignment.
+
+    If consensus aligns with For: (votesFor / totalVotes) * 100.
+    If consensus aligns with Against: (votesAgainst / totalVotes) * 100.
+    If Neutral / mixed: (votesNeutral / totalVotes) * 100.
+    """
+    votes_for, votes_against, votes_neutral = compute_extrapolated_votes_from_sentiments(
+        sentiments,
+        swarm_size=swarm_size,
+    )
+    total = votes_for + votes_against + votes_neutral
+    if total <= 0:
+        return 0, 0, 0, 0
+
+    alignment = infer_consensus_alignment(consensus, sentiments)
+    if alignment == "For":
+        ratio = votes_for / total
+    elif alignment == "Against":
+        ratio = votes_against / total
+    else:
+        ratio = votes_neutral / total
+
+    confidence = int(round(ratio * 100))
+    return max(0, min(100, confidence)), votes_for, votes_against, votes_neutral
+
+
 def compute_confidence_from_synthesis(
     sentiments: list[AgentSentiment],
     manager_confidence: int | None = None,
     evidence_quality_score: int | None = None,
+    consensus: str | None = None,
+    swarm_size: int = DEFAULT_SWARM_SIZE,
 ) -> int:
     """
-    Blend manager confidence with sentiment alignment and evidence quality.
-
-    The manager must weigh both how aligned agents are and how well they cited
-    verifiable data from the research context.
+    Strict confidence path when consensus text is provided (ignores manager LLM score).
+    Legacy blend path retained only when consensus is omitted.
     """
-    if manager_confidence is not None:
-        base = max(75, min(95, int(manager_confidence)))
-    elif sentiments:
+    if consensus is not None and consensus.strip():
+        confidence, _, _, _ = compute_strict_confidence(
+            consensus,
+            sentiments,
+            swarm_size=swarm_size,
+        )
+        return confidence
+
+    if sentiments:
         total = len(sentiments)
         for_count = sum(1 for item in sentiments if item == "For")
         against_count = sum(1 for item in sentiments if item == "Against")
         dominant = max(for_count, against_count, total - for_count - against_count)
         agreement_ratio = dominant / total
-        base = max(75, min(95, 75 + int(round(agreement_ratio * 20))))
-    else:
-        base = 75
+        return max(0, min(100, int(round(agreement_ratio * 100))))
 
-    if evidence_quality_score is None:
-        return base
-
-    quality = max(0, min(100, int(evidence_quality_score)))
-    blended = int(round(0.55 * base + 0.45 * max(75, quality)))
-
-    if quality < 60:
-        blended = min(blended, 82)
-    if quality < 45:
-        blended = min(blended, 78)
-
-    return max(75, min(95, blended))
+    return 0
 
 
 def compute_confidence_from_sentiments(

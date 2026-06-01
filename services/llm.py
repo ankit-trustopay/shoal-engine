@@ -22,16 +22,35 @@ logger = logging.getLogger(__name__)
 
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 
-ADVERSARIAL_AGENT_RULES = (
-    "ADVERSARIAL DEBATE (mandatory):\n"
-    "- You are in a live institutional war room defending your assigned stance to the death.\n"
-    "- Weaponize the web data — cite metrics, dates, and causal mechanisms, not vibes.\n"
-    "- Anticipate the strongest counterarguments from the opposing archetypes listed below "
-    "and preemptively attack them with evidence.\n"
+CONVERSATIONAL_DEBATE_RULES = (
+    "CONVERSATIONAL ADVERSARIAL DEBATE (mandatory):\n"
+    "- You are in a live, sequential war room. Prior agents have already spoken — read them.\n"
+    "- Name at least one prior speaker by first name and attack a specific claim "
+    '(e.g. "I disagree with Rahul because…", "Priya\'s point about X ignores…").\n'
+    "- Open with your professional identity tied to your background "
+    '(e.g. "As a risk-averse auditor…", "As a growth-stage CFO…").\n'
+    "- Weaponize the web data — cite metrics, dates, company names, and dollar figures.\n"
+    "- Anticipate opposing archetypes listed below and dismantle their logic with evidence.\n"
     "- Do NOT hedge, converge, seek compromise, or validate the other side.\n"
-    "- FORBIDDEN: roleplay stage directions (adjusts glasses, sighs), emotional narration, "
-    "or first-person character acting.\n"
-    "- Write exactly 2 sentences of aggressive, evidence-dense institutional prose."
+    "- FORBIDDEN: stage directions, emotional narration, or generic filler.\n"
+    "- Write exactly 3–4 sentences of confrontational, evidence-dense dialogue."
+)
+
+_BANNED_RECOMMENDATION_PHRASES = (
+    "monitor updates",
+    "monitor the situation",
+    "do market research",
+    "conduct market research",
+    "conduct further research",
+    "further research",
+    "stay informed",
+    "keep an eye on",
+    "more research is needed",
+    "gather more data",
+    "continue to monitor",
+    "assess the landscape",
+    "evaluate options",
+    "consider your options",
 )
 
 
@@ -69,14 +88,19 @@ def build_manager_system(agent_count: int) -> str:
         '"For", "Against", or "Neutral".\n'
         "- Classify strictly from each agent's stated position relative to the premise — not your synthesis.\n"
         "- Use the exact agent role labels provided in the user message.\n\n"
-        "EVIDENCE QUALITY & CONFIDENCE (mandatory):\n"
+        "EVIDENCE QUALITY (mandatory):\n"
         "- Score how well agents used specific, verifiable data from the web context "
         "(metrics, dates, named sources, causal mechanisms).\n"
         "- Penalize vague rhetoric, uncited claims, or ignoring available deep research.\n"
         "- evidenceQualityScore (0-100): overall panel evidence quality independent of sentiment.\n"
-        "- confidence (75-95): must reflect BOTH sentiment alignment AND evidenceQualityScore.\n"
-        "  * Unanimous sentiment with weak evidence (evidenceQualityScore < 60) must not exceed 82.\n"
-        "  * Strong evidence with split sentiment may still reach 85+ if citations are concrete.\n\n"
+        "- Do NOT output a confidence score — confidence is computed algorithmically downstream.\n\n"
+        "HYPER-SPECIFIC RECOMMENDATIONS (mandatory):\n"
+        "- recommendedActions: provide 2-3 steps that are immediately executable.\n"
+        "- Each body MUST include at least one of: a dollar amount, a percentage, a headcount, "
+        "a named company/competitor, a dated milestone, or a quantified KPI target.\n"
+        "- BANNED generic phrases (reject entirely): "
+        '"Monitor updates", "Do market research", "Conduct further research", '
+        '"Stay informed", "Keep an eye on", "Gather more data", "Evaluate options".\n\n'
         "OUTPUT (valid JSON only — no markdown fences, no commentary):\n"
         "{\n"
         '  "consensus": "<final institutional consensus; obey premise formatting constraints>",\n'
@@ -84,13 +108,12 @@ def build_manager_system(agent_count: int) -> str:
         '    {"role": "<exact agent role>", "sentiment": "For"|"Against"|"Neutral"}\n'
         "  ],\n"
         '  "recommendedActions": [\n'
-        '    {"step": 1, "title": "<short imperative>", "body": "<specific actionable detail>"}\n'
+        '    {"step": 1, "title": "<short imperative with a number or proper noun>", '
+        '"body": "<specific action with metrics, $ figures, company names, or deadlines>"}\n'
         "  ],\n"
         '  "minorityDissent": "<1-2 sentences summarizing the strongest opposing argument; empty string if unanimous>",\n'
-        '  "evidenceQualityScore": <integer 0-100>,\n'
-        '  "confidence": <integer 75-95; blend sentiment + evidence quality>\n'
+        '  "evidenceQualityScore": <integer 0-100>\n'
         "}\n\n"
-        "recommendedActions: provide 2-3 highly specific steps grounded in consensus and evidence.\n"
         "minorityDissent: distill the strongest counter-argument from Against/Neutral agents."
     )
 
@@ -118,6 +141,35 @@ def _strip_json_fence(text: str) -> str:
     return cleaned.strip()
 
 
+def _contains_banned_recommendation_text(text: str) -> bool:
+    lowered = text.lower()
+    return any(phrase in lowered for phrase in _BANNED_RECOMMENDATION_PHRASES)
+
+
+def _has_specificity_signal(text: str) -> bool:
+    """Require quantified or named-entity detail in recommendation copy."""
+    if re.search(r"\$[\d,.]+[kmb]?", text, re.IGNORECASE):
+        return True
+    if re.search(r"\b\d+(\.\d+)?%|\b\d{1,3}(,\d{3})+\b|\bQ[1-4]\s*20\d{2}\b", text):
+        return True
+    if re.search(
+        r"\b(by|before|within|in)\s+\d+\s+(days?|weeks?|months?|quarters?)\b",
+        text,
+        re.IGNORECASE,
+    ):
+        return True
+    if re.search(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2}\b", text):
+        return True
+    return False
+
+
+def _is_actionable_recommendation(title: str, body: str) -> bool:
+    combined = f"{title} {body}"
+    if _contains_banned_recommendation_text(combined):
+        return False
+    return _has_specificity_signal(combined)
+
+
 def _parse_recommended_actions(value: Any) -> list[RecommendedAction]:
     if not isinstance(value, list):
         return []
@@ -129,6 +181,12 @@ def _parse_recommended_actions(value: Any) -> list[RecommendedAction]:
         title = str(item.get("title") or "").strip()
         body = str(item.get("body") or item.get("description") or "").strip()
         if not title or not body:
+            continue
+        if not _is_actionable_recommendation(title, body):
+            logger.warning(
+                "Rejected generic/vague recommendedAction: title=%r",
+                title[:80],
+            )
             continue
         step_raw = item.get("step")
         step = int(step_raw) if isinstance(step_raw, (int, float)) else index + 1
@@ -209,13 +267,6 @@ def parse_manager_synthesis_payload(
         payload.get("minorityDissent") or payload.get("minority_dissent") or "",
     ).strip()
 
-    confidence_raw = payload.get("confidence")
-    confidence = (
-        int(confidence_raw)
-        if isinstance(confidence_raw, (int, float))
-        else 75
-    )
-
     quality_raw = payload.get("evidenceQualityScore") or payload.get("evidence_quality_score")
     evidence_quality_score = (
         int(quality_raw)
@@ -228,7 +279,7 @@ def parse_manager_synthesis_payload(
         agent_sentiments=agent_sentiments,
         recommended_actions=recommended_actions,
         minority_dissent=minority_dissent,
-        confidence=max(75, min(95, confidence)),
+        confidence=0,
         evidence_quality_score=max(0, min(100, evidence_quality_score)),
     )
 
@@ -254,8 +305,23 @@ def format_persona_system_prompt(
         f"Known biases (lean into them): {persona['biases']}\n"
         f"Attack vector: {persona['debate_instruction']}\n\n"
         f"Opposing archetypes you must anticipate and dismantle:\n{opponents}\n\n"
-        f"{ADVERSARIAL_AGENT_RULES}"
+        f"{CONVERSATIONAL_DEBATE_RULES}"
     )
+
+
+def _format_prior_debate_transcript(prior_turns: list[dict[str, str]]) -> str:
+    if not prior_turns:
+        return "No prior speakers yet — you open the live debate."
+
+    lines: list[str] = []
+    for turn in prior_turns:
+        name = turn.get("agentName") or "Agent"
+        role = turn.get("role") or ""
+        timestamp = turn.get("timestamp") or ""
+        text = turn.get("text") or ""
+        header = f"[{timestamp}] {name} ({role})".strip()
+        lines.append(f"{header}:\n{text}")
+    return "\n\n".join(lines)
 
 
 async def chat_completion_with_fallback(
@@ -361,8 +427,9 @@ def _build_reflection_final_prompt(draft: str, critique: str) -> str:
         f"DRAFT:\n{draft}\n\n"
         f"SELF-CRITIQUE:\n{critique}\n\n"
         "Revise into your FINAL argument.\n"
-        "Output ONLY the final text: exactly 2 sentences of aggressive, evidence-dense "
-        "institutional prose. No labels, bullets, or preamble."
+        "Output ONLY the final text: exactly 3–4 sentences of conversational, "
+        "evidence-dense dialogue. Name a prior speaker if any spoke before you. "
+        "No labels, bullets, or preamble."
     )
 
 
@@ -373,11 +440,16 @@ async def get_persona_debate_response(
     web_data: str,
     model: str,
     opposing_roles: list[str],
+    prior_turns: list[dict[str, str]] | None = None,
 ) -> dict[str, str]:
     """
-    Run an adversarial debate turn with draft → self-critique → final reflection loop.
+    Run a sequential conversational debate turn with draft → critique → final loop.
     """
     role_name = str(persona.get("role") or persona.get("name") or "Agent")
+    agent_name = str(persona.get("name") or role_name)
+    prior_turns = prior_turns or []
+    transcript_block = _format_prior_debate_transcript(prior_turns)
+
     system_prompt = (
         f"{format_persona_system_prompt(persona, opposing_roles)}\n\n"
         f"Live web data (includes deep page extracts where available):\n{web_data}"
@@ -392,7 +464,10 @@ async def get_persona_debate_response(
             system_prompt,
             (
                 f"{premise_block}\n\n"
-                "STEP 1 — DRAFT: Write your initial argument in exactly 2 sentences. "
+                f"Debate transcript so far:\n{transcript_block}\n\n"
+                f"You are {agent_name} ({role_name}). "
+                "STEP 1 — DRAFT: Write your live debate turn in exactly 3–4 sentences. "
+                "Reference a prior speaker by name if any spoke before you. "
                 "Cite specific data from the web context."
             ),
             temperature=0.6,
@@ -483,11 +558,10 @@ async def get_manager_synthesis(
 
     if parsed is not None:
         logger.info(
-            "Manager synthesis via %s: sentiments=%s evidenceQuality=%s confidence=%s actions=%s",
+            "Manager synthesis via %s: sentiments=%s evidenceQuality=%s actions=%s",
             model_used,
             parsed.agent_sentiments,
             parsed.evidence_quality_score,
-            parsed.confidence,
             len(parsed.recommended_actions),
         )
         return parsed

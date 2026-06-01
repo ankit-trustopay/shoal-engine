@@ -23,10 +23,28 @@ from services.scraper import EvidenceItem, scrape_for_premise
 
 logger = logging.getLogger(__name__)
 
+SECONDS_PER_DEBATE_TURN = 12
+
+
+def format_debate_timestamp(turn_index: int) -> str:
+    """Synthetic war-room clock for transcript entries (00:00, 00:12, …)."""
+    total_seconds = turn_index * SECONDS_PER_DEBATE_TURN
+    minutes, seconds = divmod(total_seconds, 60)
+    return f"{minutes:02d}:{seconds:02d}"
+
+
+@dataclass
+class DebateTranscriptEntry:
+    agentName: str
+    role: str
+    text: str
+    timestamp: str
+
 
 @dataclass
 class SwarmIgniteResult:
     messages: list[dict[str, str]]
+    debate_transcript: list[DebateTranscriptEntry]
     evidence: list[EvidenceItem]
     agent_profiles: list[dict[str, Any]]
     manager_synthesis: ManagerSynthesis
@@ -40,7 +58,7 @@ async def run_swarm_ignite(
     model: str | None = None,
 ) -> SwarmIgniteResult:
     """
-    Execute deep research, adversarial persona generation, reflective debate, and synthesis.
+    Execute deep research, adversarial persona generation, sequential debate, and synthesis.
     """
     client = get_client()
     trimmed_premise = premise.strip()
@@ -78,24 +96,53 @@ async def run_swarm_ignite(
 
     all_roles = [persona["role"] for persona in personas]
 
-    agent_tasks = [
-        get_persona_debate_response(
+    agent_results: list[dict[str, str]] = []
+    debate_transcript: list[DebateTranscriptEntry] = []
+    prior_turns: list[dict[str, str]] = []
+
+    for turn_index, persona in enumerate(personas):
+        opposing_roles = [role for role in all_roles if role != persona["role"]]
+        turn_message = await get_persona_debate_response(
             client,
             persona,
             trimmed_premise,
             web_data,
             model=model or "",
-            opposing_roles=[role for role in all_roles if role != persona["role"]],
+            opposing_roles=opposing_roles,
+            prior_turns=prior_turns,
         )
-        for persona in personas
-    ]
+        agent_results.append(turn_message)
 
-    agent_results = await asyncio.gather(*agent_tasks)
-    agent_roles = [msg["role"] for msg in agent_results]
+        entry = DebateTranscriptEntry(
+            agentName=str(persona.get("name") or turn_message["role"]),
+            role=turn_message["role"],
+            text=turn_message["text"],
+            timestamp=format_debate_timestamp(turn_index),
+        )
+        debate_transcript.append(entry)
+        prior_turns.append(
+            {
+                "agentName": entry.agentName,
+                "role": entry.role,
+                "text": entry.text,
+                "timestamp": entry.timestamp,
+            },
+        )
+
+        logger.info(
+            "Swarm %s debate turn %s/%s — %s (%s)",
+            swarm_id,
+            turn_index + 1,
+            executed_count,
+            entry.agentName,
+            entry.timestamp,
+        )
 
     combined_perspectives = "\n\n".join(
-        f"{msg['role']} ({personas[i]['name']}):\n{msg['text']}"
-        for i, msg in enumerate(agent_results)
+        (
+            f"[{entry.timestamp}] {entry.agentName} ({entry.role}):\n{entry.text}"
+            for entry in debate_transcript
+        ),
     )
 
     manager_synthesis = await get_manager_synthesis(
@@ -103,7 +150,7 @@ async def run_swarm_ignite(
         trimmed_premise,
         web_data,
         combined_perspectives,
-        agent_roles,
+        [msg["role"] for msg in agent_results],
         model=model or "",
     )
 
@@ -115,14 +162,15 @@ async def run_swarm_ignite(
     agent_profiles = [persona_to_agent_profile(persona) for persona in personas]
 
     logger.info(
-        "Swarm %s complete: %s agent messages + manager (sentiments=%s)",
+        "Swarm %s complete: %s transcript turns + manager (sentiments=%s)",
         swarm_id,
-        len(agent_results),
+        len(debate_transcript),
         manager_synthesis.agent_sentiments,
     )
 
     return SwarmIgniteResult(
         messages=[*agent_results, manager_result],
+        debate_transcript=debate_transcript,
         evidence=evidence,
         agent_profiles=agent_profiles,
         manager_synthesis=manager_synthesis,
