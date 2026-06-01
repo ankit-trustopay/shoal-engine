@@ -1,15 +1,12 @@
 import logging
-import time
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import BackgroundTasks, FastAPI
 from pydantic import BaseModel, Field, model_validator
 from typing import Self
 
-from services.dynamic_personas import MAX_DEBATE_AGENTS, clamp_agent_count
-from services.metrics import compute_strict_confidence, compute_swarm_credits
-from services.orchestrator import run_swarm_ignite
-from services.webhook_notify import notify_swarm_failure
+from services.dynamic_personas import MAX_DEBATE_AGENTS
+from services.ignite_background import run_crew_and_webhook
 
 load_dotenv()
 
@@ -37,80 +34,9 @@ class IgniteRequest(BaseModel):
         return self
 
 
-class DebateMessage(BaseModel):
-    role: str
-    text: str
-
-
-class EvidencePayload(BaseModel):
-    title: str
-    source: str
-    url: str
-    snippet: str
-
-
-class AgentProfilePayload(BaseModel):
-    id: int = Field(..., ge=1)
-    name: str
-    role: str
-    age: int = Field(..., ge=18, le=80)
-    location: str
-    income: str
-    maritalStatus: str = ""
-    culturalBackground: str = ""
-    iq: int = Field(..., ge=90, le=140)
-    eq: int = Field(..., ge=90, le=140)
-    riskTolerance: str
-    biases: str
-    backstory: str
-
-
-class RecommendedActionPayload(BaseModel):
-    step: int = Field(..., ge=1)
-    title: str = Field(..., min_length=1)
-    body: str = Field(..., min_length=1)
-
-
-class DebateTranscriptEntryPayload(BaseModel):
-    agentName: str = Field(..., min_length=1)
-    role: str = Field(..., min_length=1)
-    text: str = Field(..., min_length=1)
-    timestamp: str = Field(..., min_length=1)
-
-
-class IgniteResponse(BaseModel):
+class IgniteAcceptedResponse(BaseModel):
     status: str
     swarmId: str
-    messages: list[DebateMessage]
-    confidence: int = Field(..., ge=0, le=100)
-    votesFor: int = Field(..., ge=0)
-    votesAgainst: int = Field(..., ge=0)
-    votesNeutral: int = Field(..., ge=0)
-    runtime: int = Field(..., ge=0)
-    cost: float = Field(..., ge=0)
-    evidence: list[EvidencePayload]
-    agentProfiles: list[AgentProfilePayload]
-    swarmSize: int = Field(..., ge=1)
-    agentCount: int = Field(..., ge=1)
-    model: str | None = None
-    recommendedActions: list[RecommendedActionPayload] = Field(default_factory=list)
-    minorityDissent: str | None = None
-    debateTranscript: list[DebateTranscriptEntryPayload] = Field(default_factory=list)
-
-
-def _failure_message(exc: Exception) -> str:
-    if isinstance(exc, HTTPException):
-        detail = exc.detail
-        if isinstance(detail, str):
-            return detail
-        return str(detail)
-    return str(exc) or exc.__class__.__name__
-
-
-def _handle_fatal_ignite_error(swarm_id: str, exc: Exception) -> None:
-    message = _failure_message(exc)
-    logger.error("Fatal ignite error for swarm %s: %s", swarm_id, message)
-    notify_swarm_failure(swarm_id, message)
 
 
 @app.get("/health")
@@ -118,126 +44,27 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
-@app.post("/ignite", response_model=IgniteResponse)
-async def ignite(payload: IgniteRequest) -> IgniteResponse:
-    started = time.perf_counter()
+@app.post("/ignite", response_model=IgniteAcceptedResponse)
+def ignite(
+    payload: IgniteRequest,
+    background_tasks: BackgroundTasks,
+) -> IgniteAcceptedResponse:
+    """
+    Accept ignite job and return immediately. CrewAI runs in a background task
+    and POSTs results to WEBHOOK_URL (or SHOAL_WEBHOOK_URL) when finished.
+    """
+    background_tasks.add_task(
+        run_crew_and_webhook,
+        payload.swarmId,
+        payload.premise,
+        payload.agentCount,
+        payload.model,
+        payload.swarmSize,
+    )
 
-    try:
-        debate_count = clamp_agent_count(payload.agentCount)
+    logger.info("Queued background CrewAI for swarm %s", payload.swarmId)
 
-        result = await run_swarm_ignite(
-            payload.swarmId,
-            payload.premise,
-            agent_count=debate_count,
-            model=payload.model,
-        )
-
-        elapsed_sec = time.perf_counter() - started
-        runtime = max(1, int(round(elapsed_sec)))
-
-        messages = [
-            DebateMessage(role=msg["role"], text=msg["text"])
-            for msg in result.messages
-        ]
-
-        synthesis = result.manager_synthesis
-        sentiments = synthesis.agent_sentiments
-        swarm_size = payload.swarmSize or debate_count
-
-        confidence, votes_for, votes_against, votes_neutral = compute_strict_confidence(
-            synthesis.consensus,
-            sentiments,
-            swarm_size=swarm_size,
-        )
-
-        logger.info(
-            "Swarm %s strict confidence=%s votes=%s/%s/%s (consensus-aligned)",
-            payload.swarmId,
-            confidence,
-            votes_for,
-            votes_against,
-            votes_neutral,
-        )
-
-        executed_agents = result.executed_agent_count
-        cost = compute_swarm_credits(executed_agents)
-
-        recommended_actions = [
-            RecommendedActionPayload(
-                step=action.step,
-                title=action.title,
-                body=action.body,
-            )
-            for action in synthesis.recommended_actions
-        ]
-
-        minority_dissent = synthesis.minority_dissent or None
-
-        evidence = [
-            EvidencePayload(
-                title=item["title"],
-                source=item["source"],
-                url=item["url"],
-                snippet=item["snippet"],
-            )
-            for item in result.evidence
-        ]
-
-        agent_profiles = [
-            AgentProfilePayload(
-                id=profile["id"],
-                name=profile["name"],
-                role=profile["role"],
-                age=profile["age"],
-                location=profile["location"],
-                income=profile["income"],
-                maritalStatus=profile.get("maritalStatus", ""),
-                culturalBackground=profile.get("culturalBackground", ""),
-                iq=profile["iq"],
-                eq=profile["eq"],
-                riskTolerance=profile["riskTolerance"],
-                biases=profile["biases"],
-                backstory=profile["backstory"],
-            )
-            for profile in result.agent_profiles
-        ]
-
-        debate_transcript = [
-            DebateTranscriptEntryPayload(
-                agentName=entry.agentName,
-                role=entry.role,
-                text=entry.text,
-                timestamp=entry.timestamp,
-            )
-            for entry in result.debate_transcript
-        ]
-
-        return IgniteResponse(
-            status="Swarm ignited",
-            swarmId=payload.swarmId,
-            messages=messages,
-            confidence=confidence,
-            votesFor=votes_for,
-            votesAgainst=votes_against,
-            votesNeutral=votes_neutral,
-            runtime=runtime,
-            cost=cost,
-            evidence=evidence,
-            agentProfiles=agent_profiles,
-            swarmSize=swarm_size,
-            agentCount=executed_agents,
-            model=payload.model,
-            recommendedActions=recommended_actions,
-            minorityDissent=minority_dissent,
-            debateTranscript=debate_transcript,
-        )
-    except HTTPException as exc:
-        if exc.status_code >= 500:
-            _handle_fatal_ignite_error(payload.swarmId, exc)
-        raise
-    except Exception as exc:
-        _handle_fatal_ignite_error(payload.swarmId, exc)
-        raise HTTPException(
-            status_code=502,
-            detail=_failure_message(exc),
-        ) from exc
+    return IgniteAcceptedResponse(
+        status="deliberating",
+        swarmId=payload.swarmId,
+    )
