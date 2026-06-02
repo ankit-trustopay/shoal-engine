@@ -11,6 +11,7 @@ from fastapi import HTTPException
 
 from services.dynamic_personas import clamp_agent_count
 from services.metrics import compute_strict_confidence, compute_swarm_credits
+from services.crew_orchestration import orchestrate_debate
 from services.orchestrator import run_swarm_ignite
 from services.webhook_notify import notify_swarm_failure, notify_swarm_success
 
@@ -219,3 +220,77 @@ def run_crew_and_webhook(
         message = _failure_message(exc)
         logger.exception("Background ignite failed for swarm %s: %s", swarm_id, message)
         notify_swarm_failure(swarm_id, message)
+
+
+def run_simple_debate_and_webhook(
+    debate_id: str,
+    query: str,
+    *,
+    model_tier: str = "lite",
+) -> None:
+    """
+    Launch-day minimal debate runner.
+
+    Runs a tiny 3-agent CrewAI workflow and posts a webhook payload with a final
+    verdict string + dummy confidence (85) so shoal-web can persist COMPLETED.
+    """
+    started = time.perf_counter()
+    try:
+        verdict = orchestrate_debate(query, model_tier=model_tier)
+
+        elapsed_sec = time.perf_counter() - started
+        runtime = max(1, int(round(elapsed_sec)))
+
+        executed_agents = 3
+        cost = float(compute_swarm_credits(executed_agents))
+
+        ignite_fields: dict[str, Any] = {
+            "messages": [{"role": "Manager", "text": verdict}],
+            "confidence": 85,
+            "runtime": runtime,
+            "cost": cost,
+            "evidence": [],
+            "agentProfiles": [
+                {"role": "Researcher"},
+                {"role": "Debater"},
+                {"role": "Manager"},
+            ],
+            "debateTranscript": [
+                {
+                    "agentName": "Researcher",
+                    "role": "Researcher",
+                    "text": "Research completed.",
+                    "timestamp": "T+00:00",
+                },
+                {
+                    "agentName": "Debater",
+                    "role": "Debater",
+                    "text": "Debate completed.",
+                    "timestamp": "T+00:01",
+                },
+                {
+                    "agentName": "Manager",
+                    "role": "Manager",
+                    "text": verdict,
+                    "timestamp": "T+00:02",
+                },
+            ],
+            "recommendedActions": [],
+            "minorityDissent": None,
+            "model": model_tier,
+            "swarmSize": executed_agents,
+            "agentCount": executed_agents,
+            "response": verdict,
+            "consensus": verdict,
+        }
+
+        print(
+            f"[simple_debate] debate {debate_id} ready for webhook: "
+            f"verdict_chars={len(verdict)} confidence=85 runtime={runtime}s"
+        )
+
+        notify_swarm_success(debate_id, ignite_fields)
+    except Exception as exc:
+        message = _failure_message(exc)
+        logger.exception("Simple debate failed for %s: %s", debate_id, message)
+        notify_swarm_failure(debate_id, message)

@@ -5,7 +5,7 @@ from fastapi import BackgroundTasks, FastAPI
 from pydantic import BaseModel
 
 from models import DebateRequest, DebateStartRequest
-from services.ignite_background import run_crew_and_webhook
+from services.ignite_background import run_crew_and_webhook, run_simple_debate_and_webhook
 
 load_dotenv()
 
@@ -108,18 +108,12 @@ def debate(
         payload.agentCount,
     )
 
-    # Keep CEO model fixed downstream; use modelTier for worker routing.
+    # Launch-day path: run a minimal 3-agent debate and post verdict + confidence.
     background_tasks.add_task(
-        run_crew_and_webhook,
+        run_simple_debate_and_webhook,
         payload.debate_id,
         payload.query,
-        payload.agentCount,
-        None,  # CEO model resolved inside crew_orchestration.py (fixed frontier)
-        payload.agentCount,
-        payload.modelTier,
-        payload.advancedVariables.targetAudience,
-        payload.advancedVariables.pricePoint,
-        payload.advancedVariables.marketingBudget,
+        model_tier=payload.modelTier,
     )
 
     return DebateAcceptedResponse(status="deliberating", debateId=payload.debate_id)

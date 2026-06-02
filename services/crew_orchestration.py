@@ -355,3 +355,115 @@ def _fallback_transcript_from_synthesis(
             timestamp=format_debate_timestamp(0),
         ),
     ]
+
+
+def orchestrate_debate(
+    query: str,
+    *,
+    model_tier: str | None = None,
+) -> str:
+    """
+    Minimal, reliable end-to-end CrewAI debate for launch-day stability.
+
+    Uses a small fixed crew (Researcher, Debater, Manager) routed through OpenRouter
+    and returns a final string verdict.
+    """
+    trimmed = (query or "").strip()
+    if not trimmed:
+        raise HTTPException(status_code=400, detail="Missing query")
+
+    worker_model = _resolve_worker_model(model_tier)
+    llm = build_crew_llm(worker_model, temperature=0.25, max_tokens=1400)
+    tavily_tool = build_tavily_search_tool()
+    tools = [tavily_tool] if tavily_tool is not None else []
+
+    researcher = Agent(
+        role="Researcher",
+        goal="Gather quick factual context and constraints for the query.",
+        backstory="You are a pragmatic researcher. If tools are available, use them sparingly.",
+        tools=tools,
+        llm=llm,
+        allow_delegation=False,
+        verbose=True,
+    )
+
+    debater = Agent(
+        role="Debater",
+        goal="Formulate the strongest arguments for and against, and stress-test assumptions.",
+        backstory="You are an adversarial debater who surfaces risks, edge-cases, and counters.",
+        tools=[],
+        llm=llm,
+        allow_delegation=False,
+        verbose=True,
+    )
+
+    manager = Agent(
+        role="Manager",
+        goal="Synthesize into a clear verdict with actionable next steps.",
+        backstory="You produce concise, decisive outputs with concrete next actions.",
+        tools=[],
+        llm=llm,
+        allow_delegation=False,
+        verbose=True,
+    )
+
+    research_task = Task(
+        description=(
+            "You are the Researcher.\n\n"
+            f"Query:\n{trimmed}\n\n"
+            "Return a short bullet list of key facts/assumptions and 3-5 constraints.\n"
+            "If you used any sources, include the domain name in parentheses."
+        ),
+        expected_output="Bullet list of facts/assumptions and constraints.",
+        agent=researcher,
+    )
+
+    debate_task = Task(
+        description=(
+            "You are the Debater.\n\n"
+            f"Query:\n{trimmed}\n\n"
+            "Using the research context, write:\n"
+            "- Strongest case FOR (3-6 bullets)\n"
+            "- Strongest case AGAINST (3-6 bullets)\n"
+            "- Biggest unknowns (3 bullets)\n"
+        ),
+        expected_output="Pros/cons bullets plus unknowns.",
+        agent=debater,
+        context=[research_task],
+    )
+
+    verdict_task = Task(
+        description=(
+            "You are the Manager.\n\n"
+            f"Query:\n{trimmed}\n\n"
+            "Based on the Researcher + Debater outputs, return a FINAL VERDICT as plain text.\n"
+            "Format:\n"
+            "Verdict: <one sentence>\n"
+            "Rationale: <2-4 bullets>\n"
+            "Next steps: <3 numbered steps with specific metrics or deadlines>\n"
+        ),
+        expected_output="Plain text verdict with rationale and next steps.",
+        agent=manager,
+        context=[research_task, debate_task],
+    )
+
+    crew = Crew(
+        agents=[researcher, debater, manager],
+        tasks=[research_task, debate_task, verdict_task],
+        process=Process.sequential,
+        verbose=True,
+    )
+
+    try:
+        crew_result = crew.kickoff()
+    except Exception as exc:
+        logger.exception("Minimal CrewAI orchestrate_debate failed")
+        raise HTTPException(
+            status_code=502,
+            detail=f"CrewAI minimal debate failed: {exc}",
+        ) from exc
+
+    verdict = str(getattr(crew_result, "raw", crew_result) or "").strip()
+    if not verdict:
+        raise HTTPException(status_code=502, detail="CrewAI returned empty verdict")
+    return verdict
