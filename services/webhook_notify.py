@@ -97,7 +97,12 @@ def notify_debate_completion(
         logger.error("Webhook URL not configured; cannot deliver debate %s", debate_id)
         return False
 
-    safe_verdict = (verdict or "").strip() or "No verdict produced."
+    safe_verdict = (verdict or "").strip()
+    if not safe_verdict:
+        safe_verdict = (
+            "Deliberation completed without a parsed verdict string. "
+            "Check engine logs for raw agent output."
+        )
     safe_confidence = int(max(0, min(100, confidence)))
     safe_agents = [
         {

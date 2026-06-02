@@ -228,11 +228,24 @@ def run_simple_debate_and_webhook(
     billed_agents = max(3, agent_count)
     cost = float(compute_swarm_credits(billed_agents))
 
+    verdict = str(result.get("verdict") or "").strip()
+    if not verdict:
+        verdict = (
+            "Deliberation completed but the synthesizer returned an empty verdict. "
+            "See agent positions below."
+        )
+
+    agents = list(result.get("agents") or [])
+    if not agents:
+        agents = [
+            {"name": "CEO Synthesizer", "position": verdict[:500]},
+        ]
+
     notify_debate_completion(
         debate_id,
-        verdict=result["verdict"],
-        confidence=int(result["confidence"]),
-        agents=list(result["agents"]),
+        verdict=verdict,
+        confidence=int(result.get("confidence") or 0),
+        agents=agents,
         runtime=runtime,
         cost=cost,
         agent_count=billed_agents,
