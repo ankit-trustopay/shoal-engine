@@ -26,16 +26,51 @@ def _failure_message(exc: Exception) -> str:
     return str(exc) or exc.__class__.__name__
 
 
-def build_ignite_webhook_payload(
+def _normalize_message(msg: Any) -> dict[str, str] | None:
+    if not isinstance(msg, dict):
+        return None
+    role = msg.get("role") or msg.get("Role") or "Agent"
+    text = (
+        msg.get("text")
+        or msg.get("Text")
+        or msg.get("content")
+        or msg.get("message")
+        or ""
+    )
+    text = str(text).strip()
+    if not text:
+        return None
+    return {"role": str(role), "text": text}
+
+
+def _messages_from_transcript(
+    debate_transcript: list[Any],
+) -> list[dict[str, str]]:
+    messages: list[dict[str, str]] = []
+    for entry in debate_transcript:
+        if hasattr(entry, "role") and hasattr(entry, "text"):
+            role = getattr(entry, "role", "Agent")
+            text = str(getattr(entry, "text", "")).strip()
+        elif isinstance(entry, dict):
+            role = entry.get("role") or entry.get("Role") or "Agent"
+            text = str(
+                entry.get("text") or entry.get("Text") or entry.get("content") or "",
+            ).strip()
+        else:
+            continue
+        if text:
+            messages.append({"role": str(role), "text": text})
+    return messages
+
+
+def build_ignite_fields(
     *,
-    swarm_id: str,
     result: Any,
     swarm_size: int,
-    agent_count: int,
     model: str | None,
     runtime: int,
 ) -> dict[str, Any]:
-    """Flat JSON body for POST /api/webhooks/engine (parse-engine-webhook compatible)."""
+    """Ignite fields nested under reportData for shoal-web (camelCase keys)."""
     synthesis = result.manager_synthesis
     sentiments = synthesis.agent_sentiments
 
@@ -46,42 +81,66 @@ def build_ignite_webhook_payload(
     )
 
     executed_agents = result.executed_agent_count
-    cost = compute_swarm_credits(executed_agents)
+    cost = float(compute_swarm_credits(executed_agents))
+
+    messages: list[dict[str, str]] = []
+    for msg in result.messages:
+        normalized = _normalize_message(msg)
+        if normalized:
+            messages.append(normalized)
+
+    if not messages:
+        messages = _messages_from_transcript(result.debate_transcript)
+
+    if not messages and synthesis.consensus:
+        messages = [{"role": "Manager", "text": synthesis.consensus.strip()}]
+
+    debate_transcript = [
+        {
+            "agentName": entry.agentName,
+            "role": entry.role,
+            "text": entry.text,
+            "timestamp": entry.timestamp,
+        }
+        for entry in result.debate_transcript
+    ]
+
+    evidence = [
+        {
+            "title": item.get("title", ""),
+            "source": item.get("source", ""),
+            "url": item.get("url", ""),
+            "snippet": item.get("snippet", ""),
+        }
+        for item in (result.evidence or [])
+        if isinstance(item, dict)
+    ]
+
+    agent_profiles = list(result.agent_profiles or [])
 
     return {
-        "swarmId": swarm_id,
-        "messages": [
-            {"role": msg["role"], "text": msg["text"]} for msg in result.messages
-        ],
-        "confidence": confidence,
-        "votesFor": votes_for,
-        "votesAgainst": votes_against,
-        "votesNeutral": votes_neutral,
-        "runtime": runtime,
+        "messages": messages,
+        "confidence": int(confidence),
+        "votesFor": int(votes_for),
+        "votesAgainst": int(votes_against),
+        "votesNeutral": int(votes_neutral),
+        "runtime": int(runtime),
         "cost": cost,
-        "evidence": result.evidence,
-        "agentProfiles": result.agent_profiles,
-        "swarmSize": swarm_size,
-        "agentCount": executed_agents,
+        "evidence": evidence,
+        "agentProfiles": agent_profiles,
+        "swarmSize": int(swarm_size),
+        "agentCount": int(executed_agents),
         "model": model,
         "recommendedActions": [
             {
-                "step": action.step,
+                "step": int(action.step),
                 "title": action.title,
                 "body": action.body,
             }
             for action in synthesis.recommended_actions
         ],
         "minorityDissent": synthesis.minority_dissent or None,
-        "debateTranscript": [
-            {
-                "agentName": entry.agentName,
-                "role": entry.role,
-                "text": entry.text,
-                "timestamp": entry.timestamp,
-            }
-            for entry in result.debate_transcript
-        ],
+        "debateTranscript": debate_transcript,
     }
 
 
@@ -91,6 +150,10 @@ def run_crew_and_webhook(
     agent_count: int,
     model: str | None,
     swarm_size: int | None,
+    model_tier: str = "lite",
+    target_audience: str | None = None,
+    price_point: str | None = None,
+    marketing_budget: str | None = None,
 ) -> None:
     """
     Sync entrypoint for FastAPI BackgroundTasks.
@@ -101,6 +164,17 @@ def run_crew_and_webhook(
     resolved_swarm_size = swarm_size or debate_count
 
     try:
+        print(
+            "[ignite_background] vars:",
+            {
+                "swarmId": swarm_id,
+                "model_tier": model_tier,
+                "target_audience": target_audience,
+                "price_point": price_point,
+                "marketing_budget": marketing_budget,
+            },
+        )
+
         result = asyncio.run(
             run_swarm_ignite(
                 swarm_id,
@@ -113,24 +187,29 @@ def run_crew_and_webhook(
         elapsed_sec = time.perf_counter() - started
         runtime = max(1, int(round(elapsed_sec)))
 
-        payload = build_ignite_webhook_payload(
-            swarm_id=swarm_id,
+        ignite_fields = build_ignite_fields(
             result=result,
             swarm_size=resolved_swarm_size,
-            agent_count=debate_count,
             model=model,
             runtime=runtime,
         )
 
-        if not payload.get("messages"):
+        if not ignite_fields.get("messages"):
             raise ValueError("CrewAI returned no debate messages")
+
+        print(
+            f"[ignite_background] swarm {swarm_id} ready for webhook: "
+            f"messages={len(ignite_fields['messages'])} "
+            f"confidence={ignite_fields.get('confidence')} "
+            f"transcript={len(ignite_fields.get('debateTranscript') or [])}",
+        )
 
         logger.info(
             "CrewAI complete for swarm %s (runtime=%ss); posting webhook",
             swarm_id,
             runtime,
         )
-        notify_swarm_success(swarm_id, payload)
+        notify_swarm_success(swarm_id, ignite_fields)
 
     except Exception as exc:
         message = _failure_message(exc)

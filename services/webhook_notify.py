@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from typing import Any
@@ -11,6 +12,26 @@ import requests
 logger = logging.getLogger(__name__)
 
 WEBHOOK_TIMEOUT_SECONDS = 15
+
+# Keys read by shoal-web/lib/parse-engine-webhook.ts (flat body or nested reportData).
+_IGNITE_FIELD_KEYS = (
+    "messages",
+    "confidence",
+    "votesFor",
+    "votesAgainst",
+    "votesNeutral",
+    "runtime",
+    "cost",
+    "evidence",
+    "agentProfiles",
+    "debateTranscript",
+    "recommendedActions",
+    "minorityDissent",
+    "model",
+    "swarmSize",
+    "agentCount",
+    "response",
+)
 
 
 def _resolve_webhook_url() -> str | None:
@@ -31,18 +52,89 @@ def _webhook_headers() -> dict[str, str]:
     secret = os.getenv("ENGINE_WEBHOOK_SECRET", "").strip()
     if secret:
         headers["x-engine-webhook-secret"] = secret
+    else:
+        print(
+            "[webhook] WARNING: ENGINE_WEBHOOK_SECRET is not set; "
+            "shoal-web will reject the request in production",
+        )
     return headers
 
 
+def _json_safe(value: Any) -> Any:
+    """Coerce payload values to JSON-serializable primitives for requests.post(json=...)."""
+    if value is None:
+        return None
+    if isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    if hasattr(value, "__dict__"):
+        return _json_safe(vars(value))
+    return str(value)
+
+
+def format_success_webhook_body(
+    swarm_id: str,
+    ignite_fields: dict[str, Any],
+) -> dict[str, Any]:
+    """
+    Build POST body for shoal-web /api/webhooks/engine success callbacks.
+
+    Next.js accepts either:
+      - flat ignite fields + swarmId, or
+      - { swarmId, reportData: { messages, confidence, ... } }
+    """
+    report_data: dict[str, Any] = {}
+    for key in _IGNITE_FIELD_KEYS:
+        if key in ignite_fields and ignite_fields[key] is not None:
+            report_data[key] = _json_safe(ignite_fields[key])
+
+    # Guarantees looksLikeIgnitePayload() in parse-engine-webhook.ts
+    if "confidence" not in report_data:
+        report_data["confidence"] = 0
+    if "messages" not in report_data:
+        report_data["messages"] = []
+    if "evidence" not in report_data:
+        report_data["evidence"] = []
+    if "agentProfiles" not in report_data:
+        report_data["agentProfiles"] = []
+    if "debateTranscript" not in report_data:
+        report_data["debateTranscript"] = []
+
+    body: dict[str, Any] = {
+        "swarmId": swarm_id,
+        "reportData": report_data,
+    }
+    # Flat duplicate so either parser branch succeeds.
+    body.update(report_data)
+    return _json_safe(body)
+
+
 def _post_webhook(url: str, payload: dict[str, Any], swarm_id: str, label: str) -> bool:
+    headers = _webhook_headers()
+    safe_payload = _json_safe(payload)
+
+    print(f"[webhook] POST {url} ({label}) swarmId={swarm_id}")
+    print(
+        "[webhook] request payload:",
+        json.dumps(safe_payload, indent=2, default=str)[:8000],
+    )
+    print(
+        "[webhook] x-engine-webhook-secret present:",
+        bool(headers.get("x-engine-webhook-secret")),
+    )
+
     try:
         response = requests.post(
             url,
-            json=payload,
-            headers=_webhook_headers(),
+            json=safe_payload,
+            headers=headers,
             timeout=WEBHOOK_TIMEOUT_SECONDS,
         )
     except requests.RequestException as exc:
+        print(f"[webhook] POST failed ({label}) swarmId={swarm_id}: {exc}")
         logger.exception(
             "Failed to POST swarm %s webhook for %s: %s",
             label,
@@ -50,6 +142,11 @@ def _post_webhook(url: str, payload: dict[str, Any], swarm_id: str, label: str) 
             exc,
         )
         return False
+
+    print(
+        f"[webhook] response status={response.status_code} "
+        f"body={response.text[:2000]}"
+    )
 
     if response.status_code >= 400:
         logger.error(
@@ -65,13 +162,16 @@ def _post_webhook(url: str, payload: dict[str, Any], swarm_id: str, label: str) 
     return True
 
 
-def notify_swarm_success(swarm_id: str, result_payload: dict[str, Any]) -> bool:
+def notify_swarm_success(swarm_id: str, ignite_fields: dict[str, Any]) -> bool:
     """
     POST completed ignite payload to Next.js /api/webhooks/engine.
-    Expects flat ignite fields plus swarmId (see parse-engine-webhook.ts).
     """
     url = _resolve_webhook_url()
     if not url:
+        print(
+            f"[webhook] ERROR: no WEBHOOK_URL for swarm {swarm_id}; "
+            "set WEBHOOK_URL, SHOAL_WEBHOOK_URL, or SHOAL_WEB_APP_URL",
+        )
         logger.error(
             "WEBHOOK_URL / SHOAL_WEBHOOK_URL / SHOAL_WEB_APP_URL not configured; "
             "cannot deliver results for swarm %s",
@@ -79,16 +179,17 @@ def notify_swarm_success(swarm_id: str, result_payload: dict[str, Any]) -> bool:
         )
         return False
 
-    return _post_webhook(url, result_payload, swarm_id, "success")
+    body = format_success_webhook_body(swarm_id, ignite_fields)
+    return _post_webhook(url, body, swarm_id, "success")
 
 
 def notify_swarm_failure(swarm_id: str, error: str) -> bool:
     """
     POST failure payload to the Next.js engine webhook so the DB marks FAILED.
-    Returns True when the webhook accepted the payload.
     """
     url = _resolve_webhook_url()
     if not url:
+        print(f"[webhook] ERROR: no WEBHOOK_URL for failure swarm {swarm_id}")
         logger.error(
             "WEBHOOK_URL / SHOAL_WEBHOOK_URL / SHOAL_WEB_APP_URL not configured; "
             "cannot notify failure for swarm %s",
