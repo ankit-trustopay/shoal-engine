@@ -20,6 +20,9 @@ FALLBACK_OPENROUTER_MODEL = os.getenv(
 
 # OpenRouter slugs for requested UI models
 OPENROUTER_MODEL_MAP: dict[str, str] = {
+    "meta-llama/llama-3-8b-instruct": "meta-llama/llama-3-8b-instruct",
+    "llama-3-8b-instruct": "meta-llama/llama-3-8b-instruct",
+    "llama-3": "meta-llama/llama-3-8b-instruct",
     "gpt-4o": "openai/gpt-4o",
     "gpt 4o": "openai/gpt-4o",
     "gpt-4o (default)": "openai/gpt-4o",

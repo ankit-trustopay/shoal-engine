@@ -226,67 +226,85 @@ def run_simple_debate_and_webhook(
     debate_id: str,
     query: str,
     *,
+    agent_count: int = 3,
     model_tier: str = "lite",
+    target_audience: str | None = None,
+    price_point: str | None = None,
+    marketing_budget: str | None = None,
 ) -> None:
     """
-    Launch-day minimal debate runner.
+    Production 3-agent debate runner.
 
-    Runs a tiny 3-agent CrewAI workflow and posts a webhook payload with a final
-    verdict string + dummy confidence (85) so shoal-web can persist COMPLETED.
+    Runs orchestrate_debate() and POSTs results to SHOAL_WEB_URL/api/webhooks/engine
+    with the final verdict string and a calculated confidence score.
     """
     started = time.perf_counter()
     try:
-        verdict = orchestrate_debate(query, model_tier=model_tier)
+        result = orchestrate_debate(
+            query,
+            agent_count=agent_count,
+            model_tier=model_tier,
+            target_audience=target_audience,
+            price_point=price_point,
+            marketing_budget=marketing_budget,
+        )
+
+        verdict = str(result["verdict"])
+        confidence = int(result.get("confidence") or 0)
+        research_text = str(result.get("research") or "")
+        debate_text = str(result.get("debate") or "")
+        model_slug = str(result.get("model") or model_tier)
 
         elapsed_sec = time.perf_counter() - started
         runtime = max(1, int(round(elapsed_sec)))
 
         executed_agents = 3
-        cost = float(compute_swarm_credits(executed_agents))
+        billed_agents = max(executed_agents, agent_count)
+        cost = float(compute_swarm_credits(billed_agents))
 
         ignite_fields: dict[str, Any] = {
-            "messages": [{"role": "Manager", "text": verdict}],
-            "confidence": 85,
+            "messages": [{"role": "CEO Synthesizer", "text": verdict}],
+            "confidence": confidence,
             "runtime": runtime,
             "cost": cost,
             "evidence": [],
             "agentProfiles": [
-                {"role": "Researcher"},
-                {"role": "Debater"},
-                {"role": "Manager"},
+                {"role": "Market Researcher"},
+                {"role": "Skeptical Debater"},
+                {"role": "CEO Synthesizer"},
             ],
             "debateTranscript": [
                 {
-                    "agentName": "Researcher",
-                    "role": "Researcher",
-                    "text": "Research completed.",
+                    "agentName": "Market Researcher",
+                    "role": "Market Researcher",
+                    "text": research_text or "Research completed.",
                     "timestamp": "T+00:00",
                 },
                 {
-                    "agentName": "Debater",
-                    "role": "Debater",
-                    "text": "Debate completed.",
+                    "agentName": "Skeptical Debater",
+                    "role": "Skeptical Debater",
+                    "text": debate_text or "Debate completed.",
                     "timestamp": "T+00:01",
                 },
                 {
-                    "agentName": "Manager",
-                    "role": "Manager",
+                    "agentName": "CEO Synthesizer",
+                    "role": "CEO Synthesizer",
                     "text": verdict,
                     "timestamp": "T+00:02",
                 },
             ],
             "recommendedActions": [],
             "minorityDissent": None,
-            "model": model_tier,
-            "swarmSize": executed_agents,
-            "agentCount": executed_agents,
+            "model": model_slug,
+            "swarmSize": billed_agents,
+            "agentCount": billed_agents,
             "response": verdict,
             "consensus": verdict,
         }
 
         print(
             f"[simple_debate] debate {debate_id} ready for webhook: "
-            f"verdict_chars={len(verdict)} confidence=85 runtime={runtime}s"
+            f"verdict_chars={len(verdict)} confidence={confidence} runtime={runtime}s"
         )
 
         notify_swarm_success(debate_id, ignite_fields)

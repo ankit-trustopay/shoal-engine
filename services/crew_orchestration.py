@@ -54,10 +54,20 @@ LITE_WORKER_MODEL = "deepseek-v3"
 PLUS_WORKER_MODEL = "claude-3.5-sonnet"
 CEO_FIXED_MODEL = "gpt-4o"
 
+# Production simple-debate models (OpenRouter slugs)
+SIMPLE_DEBATE_LITE_MODEL = "meta-llama/llama-3-8b-instruct"
+SIMPLE_DEBATE_PLUS_MODEL = "openai/gpt-4o"
+
 
 def _resolve_worker_model(model_tier: str | None) -> str:
     tier = (model_tier or "lite").strip().lower()
     return PLUS_WORKER_MODEL if tier == "plus" else LITE_WORKER_MODEL
+
+
+def _resolve_simple_debate_model(model_tier: str | None) -> str:
+    """OpenRouter model for the 3-agent production debate crew."""
+    tier = (model_tier or "lite").strip().lower()
+    return SIMPLE_DEBATE_PLUS_MODEL if tier == "plus" else SIMPLE_DEBATE_LITE_MODEL
 
 
 def _resolve_ceo_model(requested: str | None) -> str:
@@ -357,50 +367,92 @@ def _fallback_transcript_from_synthesis(
     ]
 
 
+def _task_output_text(task_output: object) -> str:
+    return str(getattr(task_output, "raw", task_output) or "").strip()
+
+
+def _extract_sequential_task_outputs(crew_result: object, expected_count: int) -> list[str]:
+    """Best-effort extraction of per-task outputs from CrewAI kickoff result."""
+    outputs: list[str] = []
+    task_outputs = getattr(crew_result, "tasks_output", None)
+    if task_outputs:
+        for item in list(task_outputs)[:expected_count]:
+            outputs.append(_task_output_text(item))
+    while len(outputs) < expected_count:
+        outputs.append("")
+    return outputs
+
+
 def orchestrate_debate(
     query: str,
     *,
+    agent_count: int = 3,
     model_tier: str | None = None,
-) -> str:
+    target_audience: str | None = None,
+    price_point: str | None = None,
+    marketing_budget: str | None = None,
+) -> dict[str, str | int]:
     """
-    Minimal, reliable end-to-end CrewAI debate for launch-day stability.
+    Production-ready 3-agent CrewAI debate via OpenRouter.
 
-    Uses a small fixed crew (Researcher, Debater, Manager) routed through OpenRouter
-    and returns a final string verdict.
+    Ignores large agent_count for execution (always runs exactly 3 agents) but
+    accepts the parameter for API compatibility and downstream billing metadata.
+
+    Returns dict with verdict, intermediate outputs, and calculated confidence (0-100).
     """
     trimmed = (query or "").strip()
     if not trimmed:
         raise HTTPException(status_code=400, detail="Missing query")
 
-    worker_model = _resolve_worker_model(model_tier)
-    llm = build_crew_llm(worker_model, temperature=0.25, max_tokens=1400)
-    tavily_tool = build_tavily_search_tool()
-    tools = [tavily_tool] if tavily_tool is not None else []
+    _ = agent_count  # reserved for billing metadata; crew size is fixed at 3
 
-    researcher = Agent(
-        role="Researcher",
-        goal="Gather quick factual context and constraints for the query.",
-        backstory="You are a pragmatic researcher. If tools are available, use them sparingly.",
-        tools=tools,
+    context_lines: list[str] = []
+    if target_audience and target_audience.strip():
+        context_lines.append(f"Target audience: {target_audience.strip()}")
+    if price_point and price_point.strip():
+        context_lines.append(f"Price point: {price_point.strip()}")
+    if marketing_budget and marketing_budget.strip():
+        context_lines.append(f"Marketing budget: {marketing_budget.strip()}")
+    context_block = ("\n".join(context_lines) + "\n\n") if context_lines else ""
+
+    openrouter_model = _resolve_simple_debate_model(model_tier)
+    llm = build_crew_llm(openrouter_model, temperature=0.3, max_tokens=2048)
+    tavily_tool = build_tavily_search_tool()
+    research_tools = [tavily_tool] if tavily_tool is not None else []
+
+    market_researcher = Agent(
+        role="Market Researcher",
+        goal="Find concrete facts, data points, and market context about the query.",
+        backstory=(
+            "You are a sharp market researcher. You surface verifiable facts, "
+            "competitor context, and customer dynamics. Be specific and concise."
+        ),
+        tools=research_tools,
         llm=llm,
         allow_delegation=False,
         verbose=True,
     )
 
-    debater = Agent(
-        role="Debater",
-        goal="Formulate the strongest arguments for and against, and stress-test assumptions.",
-        backstory="You are an adversarial debater who surfaces risks, edge-cases, and counters.",
+    skeptical_debater = Agent(
+        role="Skeptical Debater",
+        goal="Find flaws, friction, and counter-arguments in the researcher's facts.",
+        backstory=(
+            "You stress-test every claim. You hunt for blind spots, execution risk, "
+            "and reasons the consensus might be wrong."
+        ),
         tools=[],
         llm=llm,
         allow_delegation=False,
         verbose=True,
     )
 
-    manager = Agent(
-        role="Manager",
-        goal="Synthesize into a clear verdict with actionable next steps.",
-        backstory="You produce concise, decisive outputs with concrete next actions.",
+    ceo_synthesizer = Agent(
+        role="CEO Synthesizer",
+        goal="Read the debate and output a final verdict the executive team can act on.",
+        backstory=(
+            "You are the CEO synthesizer. You weigh evidence vs skepticism and "
+            "deliver a decisive verdict with clear rationale and next steps."
+        ),
         tools=[],
         llm=llm,
         allow_delegation=False,
@@ -409,61 +461,92 @@ def orchestrate_debate(
 
     research_task = Task(
         description=(
-            "You are the Researcher.\n\n"
+            "You are the Market Researcher.\n\n"
+            f"{context_block}"
             f"Query:\n{trimmed}\n\n"
-            "Return a short bullet list of key facts/assumptions and 3-5 constraints.\n"
-            "If you used any sources, include the domain name in parentheses."
+            "Find facts about this query. Return:\n"
+            "- 5-8 bullet facts (with numbers or named entities where possible)\n"
+            "- 3 key assumptions\n"
+            "- 2-3 market constraints or risks\n"
         ),
-        expected_output="Bullet list of facts/assumptions and constraints.",
-        agent=researcher,
+        expected_output="Structured research bullets with facts, assumptions, and constraints.",
+        agent=market_researcher,
     )
 
     debate_task = Task(
         description=(
-            "You are the Debater.\n\n"
+            "You are the Skeptical Debater.\n\n"
+            f"{context_block}"
             f"Query:\n{trimmed}\n\n"
-            "Using the research context, write:\n"
-            "- Strongest case FOR (3-6 bullets)\n"
-            "- Strongest case AGAINST (3-6 bullets)\n"
-            "- Biggest unknowns (3 bullets)\n"
+            "Using the Market Researcher's output, find flaws and friction:\n"
+            "- Challenge at least 3 specific claims from the research\n"
+            "- List execution risks and counter-scenarios\n"
+            "- State what evidence is missing or weak\n"
         ),
-        expected_output="Pros/cons bullets plus unknowns.",
-        agent=debater,
+        expected_output="Critical debate notes challenging the research.",
+        agent=skeptical_debater,
         context=[research_task],
     )
 
     verdict_task = Task(
         description=(
-            "You are the Manager.\n\n"
+            "You are the CEO Synthesizer.\n\n"
+            f"{context_block}"
             f"Query:\n{trimmed}\n\n"
-            "Based on the Researcher + Debater outputs, return a FINAL VERDICT as plain text.\n"
-            "Format:\n"
-            "Verdict: <one sentence>\n"
+            "Read the Market Researcher and Skeptical Debater outputs. "
+            "Output a FINAL VERDICT as plain text:\n"
+            "Verdict: <one clear sentence>\n"
             "Rationale: <2-4 bullets>\n"
-            "Next steps: <3 numbered steps with specific metrics or deadlines>\n"
+            "Next steps: <3 numbered, actionable steps>\n"
         ),
-        expected_output="Plain text verdict with rationale and next steps.",
-        agent=manager,
+        expected_output="Plain-text final verdict with rationale and next steps.",
+        agent=ceo_synthesizer,
         context=[research_task, debate_task],
     )
 
     crew = Crew(
-        agents=[researcher, debater, manager],
+        agents=[market_researcher, skeptical_debater, ceo_synthesizer],
         tasks=[research_task, debate_task, verdict_task],
         process=Process.sequential,
         verbose=True,
     )
 
+    logger.info(
+        "Starting simple debate crew (model=%s tier=%s agents=3)",
+        openrouter_model,
+        model_tier,
+    )
+
     try:
         crew_result = crew.kickoff()
     except Exception as exc:
-        logger.exception("Minimal CrewAI orchestrate_debate failed")
+        logger.exception("CrewAI orchestrate_debate failed")
         raise HTTPException(
             status_code=502,
-            detail=f"CrewAI minimal debate failed: {exc}",
+            detail=f"CrewAI debate failed: {exc}",
         ) from exc
 
-    verdict = str(getattr(crew_result, "raw", crew_result) or "").strip()
+    task_texts = _extract_sequential_task_outputs(crew_result, 3)
+    research_output = task_texts[0]
+    debate_output = task_texts[1]
+    verdict = task_texts[2] or str(getattr(crew_result, "raw", crew_result) or "").strip()
+
     if not verdict:
         raise HTTPException(status_code=502, detail="CrewAI returned empty verdict")
-    return verdict
+
+    from services.metrics import AgentSentiment, compute_strict_confidence
+
+    sentiments: list[AgentSentiment] = ["For", "Against", "Neutral"]
+    confidence, _, _, _ = compute_strict_confidence(
+        verdict,
+        sentiments,
+        swarm_size=3,
+    )
+
+    return {
+        "verdict": verdict,
+        "research": research_output,
+        "debate": debate_output,
+        "confidence": confidence,
+        "model": openrouter_model,
+    }

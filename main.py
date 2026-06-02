@@ -108,12 +108,16 @@ def debate(
         payload.agentCount,
     )
 
-    # Launch-day path: run a minimal 3-agent debate and post verdict + confidence.
+    # Production path: 3-agent OpenRouter crew → webhook verdict + confidence.
     background_tasks.add_task(
         run_simple_debate_and_webhook,
         payload.debate_id,
         payload.query,
+        agent_count=payload.agentCount,
         model_tier=payload.modelTier,
+        target_audience=payload.advancedVariables.targetAudience,
+        price_point=payload.advancedVariables.pricePoint,
+        marketing_budget=payload.advancedVariables.marketingBudget,
     )
 
     return DebateAcceptedResponse(status="deliberating", debateId=payload.debate_id)
