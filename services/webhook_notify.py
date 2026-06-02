@@ -79,6 +79,48 @@ def _json_safe(value: Any) -> Any:
     return str(value)
 
 
+def notify_debate_completion(
+    debate_id: str,
+    *,
+    verdict: str,
+    confidence: int,
+    agents: list[dict[str, str]],
+    runtime: int,
+    cost: float,
+    agent_count: int,
+) -> bool:
+    """
+    POST canonical debate completion JSON to shoal-web /api/webhooks/engine.
+    """
+    url = _resolve_webhook_url()
+    if not url:
+        logger.error("Webhook URL not configured; cannot deliver debate %s", debate_id)
+        return False
+
+    safe_verdict = (verdict or "").strip() or "No verdict produced."
+    safe_confidence = int(max(0, min(100, confidence)))
+    safe_agents = [
+        {
+            "name": str(agent.get("name") or f"Agent {index + 1}"),
+            "position": str(agent.get("position") or "No position recorded."),
+        }
+        for index, agent in enumerate(agents)
+        if isinstance(agent, dict)
+    ]
+
+    body: dict[str, Any] = {
+        "debate_id": debate_id,
+        "status": "completed",
+        "verdict": safe_verdict,
+        "confidence": safe_confidence,
+        "agents": safe_agents,
+        "runtime": int(max(1, runtime)),
+        "cost": float(cost),
+        "agentCount": int(agent_count),
+    }
+    return _post_webhook(url, _json_safe(body), debate_id, "debate-complete")
+
+
 def format_success_webhook_body(
     swarm_id: str,
     ignite_fields: dict[str, Any],

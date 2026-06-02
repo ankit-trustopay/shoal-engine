@@ -9,11 +9,11 @@ from typing import Any
 
 from fastapi import HTTPException
 
+from services.debate_crew import fallback_debate_result, run_debate_crew
 from services.dynamic_personas import clamp_agent_count
 from services.metrics import compute_strict_confidence, compute_swarm_credits
-from services.crew_orchestration import orchestrate_debate
 from services.orchestrator import run_swarm_ignite
-from services.webhook_notify import notify_swarm_failure, notify_swarm_success
+from services.webhook_notify import notify_debate_completion, notify_swarm_failure, notify_swarm_success
 
 logger = logging.getLogger(__name__)
 
@@ -165,17 +165,6 @@ def run_crew_and_webhook(
     resolved_swarm_size = swarm_size or debate_count
 
     try:
-        print(
-            "[ignite_background] vars:",
-            {
-                "swarmId": swarm_id,
-                "model_tier": model_tier,
-                "target_audience": target_audience,
-                "price_point": price_point,
-                "marketing_budget": marketing_budget,
-            },
-        )
-
         result = asyncio.run(
             run_swarm_ignite(
                 swarm_id,
@@ -202,13 +191,6 @@ def run_crew_and_webhook(
         if not ignite_fields.get("messages"):
             raise ValueError("CrewAI returned no debate messages")
 
-        print(
-            f"[ignite_background] swarm {swarm_id} ready for webhook: "
-            f"messages={len(ignite_fields['messages'])} "
-            f"confidence={ignite_fields.get('confidence')} "
-            f"transcript={len(ignite_fields.get('debateTranscript') or [])}",
-        )
-
         logger.info(
             "CrewAI complete for swarm %s (runtime=%ss); posting webhook",
             swarm_id,
@@ -230,79 +212,28 @@ def run_simple_debate_and_webhook(
     model_mix: float = 0,
 ) -> None:
     """
-    Production 3-agent debate runner.
-
-    Runs orchestrate_debate() and POSTs results to SHOAL_WEB_URL/api/webhooks/engine
-    with the final verdict string and a calculated confidence score.
+    Run the production debate crew and POST canonical JSON to shoal-web.
+    Always delivers a payload (including engine-side fallbacks).
     """
     started = time.perf_counter()
+
     try:
-        result = orchestrate_debate(
-            query,
-            agent_count=agent_count,
-            model_mix=model_mix,
-        )
-
-        verdict = str(result["verdict"])
-        confidence = int(result.get("confidence") or 0)
-        research_text = str(result.get("research") or "")
-        debate_text = str(result.get("debate") or "")
-        model_slug = str(result.get("model") or "lite")
-
-        elapsed_sec = time.perf_counter() - started
-        runtime = max(1, int(round(elapsed_sec)))
-
-        executed_agents = 3
-        billed_agents = max(executed_agents, agent_count)
-        cost = float(compute_swarm_credits(billed_agents))
-
-        ignite_fields: dict[str, Any] = {
-            "messages": [{"role": "CEO Synthesizer", "text": verdict}],
-            "confidence": confidence,
-            "runtime": runtime,
-            "cost": cost,
-            "evidence": [],
-            "agentProfiles": [
-                {"role": "Market Researcher"},
-                {"role": "Skeptical Debater"},
-                {"role": "CEO Synthesizer"},
-            ],
-            "debateTranscript": [
-                {
-                    "agentName": "Market Researcher",
-                    "role": "Market Researcher",
-                    "text": research_text or "Research completed.",
-                    "timestamp": "T+00:00",
-                },
-                {
-                    "agentName": "Skeptical Debater",
-                    "role": "Skeptical Debater",
-                    "text": debate_text or "Debate completed.",
-                    "timestamp": "T+00:01",
-                },
-                {
-                    "agentName": "CEO Synthesizer",
-                    "role": "CEO Synthesizer",
-                    "text": verdict,
-                    "timestamp": "T+00:02",
-                },
-            ],
-            "recommendedActions": [],
-            "minorityDissent": None,
-            "model": model_slug,
-            "swarmSize": billed_agents,
-            "agentCount": billed_agents,
-            "response": verdict,
-            "consensus": verdict,
-        }
-
-        print(
-            f"[simple_debate] debate {debate_id} ready for webhook: "
-            f"verdict_chars={len(verdict)} confidence={confidence} runtime={runtime}s"
-        )
-
-        notify_swarm_success(debate_id, ignite_fields)
+        result = run_debate_crew(query, model_mix=model_mix)
     except Exception as exc:
-        message = _failure_message(exc)
-        logger.exception("Simple debate failed for %s: %s", debate_id, message)
-        notify_swarm_failure(debate_id, message)
+        logger.exception("Debate crew unexpected failure for %s", debate_id)
+        result = fallback_debate_result(str(exc))
+
+    elapsed_sec = time.perf_counter() - started
+    runtime = max(1, int(round(elapsed_sec)))
+    billed_agents = max(3, agent_count)
+    cost = float(compute_swarm_credits(billed_agents))
+
+    notify_debate_completion(
+        debate_id,
+        verdict=result["verdict"],
+        confidence=int(result["confidence"]),
+        agents=list(result["agents"]),
+        runtime=runtime,
+        cost=cost,
+        agent_count=billed_agents,
+    )

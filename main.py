@@ -5,7 +5,10 @@ from fastapi import BackgroundTasks, FastAPI
 from pydantic import BaseModel
 
 from models import DebateRequest, IgniteRequest
+from services.debate_crew import fallback_debate_result
 from services.ignite_background import run_crew_and_webhook, run_simple_debate_and_webhook
+from services.metrics import compute_swarm_credits
+from services.webhook_notify import notify_debate_completion
 
 load_dotenv()
 
@@ -14,7 +17,7 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 
-app = FastAPI(title="Shoal AI Engine", version="0.1.0")
+app = FastAPI(title="Shoal AI Engine", version="0.2.0")
 
 logger = logging.getLogger(__name__)
 
@@ -39,19 +42,12 @@ def ignite(
     payload: IgniteRequest,
     background_tasks: BackgroundTasks,
 ) -> IgniteAcceptedResponse:
-    """
-    Accept ignite job and return immediately. CrewAI runs in a background task
-    and POSTs results to WEBHOOK_URL (or SHOAL_WEBHOOK_URL) when finished.
-    """
+    """Accept ignite job; CrewAI runs in background and POSTs results via webhook."""
     resolved_model = payload.model or payload.model_tier
 
     logger.info(
-        "Ignite accepted: swarm=%s tier=%s audience=%r price=%r budget=%r agents=%s model=%r",
+        "Ignite accepted: swarm=%s agents=%s model=%r",
         payload.swarmId,
-        payload.model_tier,
-        payload.target_audience,
-        payload.price_point,
-        payload.marketing_budget,
         payload.agentCount,
         resolved_model,
     )
@@ -69,8 +65,6 @@ def ignite(
         payload.marketing_budget,
     )
 
-    logger.info("Queued background CrewAI for swarm %s", payload.swarmId)
-
     return IgniteAcceptedResponse(
         status="deliberating",
         swarmId=payload.swarmId,
@@ -83,13 +77,32 @@ def _run_debate_crew_and_webhook(
     agent_count: int,
     model_mix: float,
 ) -> None:
-    """Background worker: CrewAI debate + webhook delivery."""
-    run_simple_debate_and_webhook(
-        debate_id,
-        query,
-        agent_count=agent_count,
-        model_mix=model_mix,
-    )
+    """
+    Background worker with a hard guarantee: webhook always receives debate JSON.
+    """
+    try:
+        run_simple_debate_and_webhook(
+            debate_id,
+            query,
+            agent_count=agent_count,
+            model_mix=model_mix,
+        )
+    except Exception as exc:
+        logger.exception(
+            "Debate background task failed for %s; sending fallback webhook",
+            debate_id,
+        )
+        fallback = fallback_debate_result(str(exc))
+        cost = float(compute_swarm_credits(max(3, agent_count)))
+        notify_debate_completion(
+            debate_id,
+            verdict=fallback["verdict"],
+            confidence=int(fallback["confidence"]),
+            agents=list(fallback["agents"]),
+            runtime=1,
+            cost=cost,
+            agent_count=max(3, agent_count),
+        )
 
 
 @app.post("/debate", response_model=DebateAcceptedResponse)
@@ -100,20 +113,13 @@ def debate(
     """
     Accept a debate job from shoal-web and return immediately.
 
-    Expected JSON body:
-    {
-      "debate_id": "...",
-      "query": "...",
-      "agent_count": 50,
-      "model_mix": 25
-    }
+    Body: { debate_id, query, agent_count, model_mix }
     """
     logger.info(
-        "Debate accepted: debate_id=%s agents=%s model_mix=%s query_len=%s",
+        "Debate accepted: debate_id=%s agents=%s model_mix=%s",
         payload.debate_id,
         payload.agent_count,
         payload.model_mix,
-        len(payload.query),
     )
 
     background_tasks.add_task(
