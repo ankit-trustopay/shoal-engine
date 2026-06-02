@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import traceback
 from typing import Any
 
 from crewai import Agent, Crew, Process, Task
@@ -383,20 +384,23 @@ def _extract_sequential_task_outputs(crew_result: object, expected_count: int) -
     return outputs
 
 
+def _resolve_model_tier_from_mix(model_mix: float) -> str:
+    """0% mix = all Lite; any Plus share routes to the Plus OpenRouter model."""
+    return "plus" if model_mix > 0 else "lite"
+
+
 def orchestrate_debate(
     query: str,
     *,
     agent_count: int = 3,
-    model_tier: str | None = None,
-    target_audience: str | None = None,
-    price_point: str | None = None,
-    marketing_budget: str | None = None,
+    model_mix: float = 0,
 ) -> dict[str, str | int]:
     """
     Production-ready 3-agent CrewAI debate via OpenRouter.
 
     Ignores large agent_count for execution (always runs exactly 3 agents) but
     accepts the parameter for API compatibility and downstream billing metadata.
+    model_mix is the % of Plus models (0–100) from the frontend slider.
 
     Returns dict with verdict, intermediate outputs, and calculated confidence (0-100).
     """
@@ -406,14 +410,11 @@ def orchestrate_debate(
 
     _ = agent_count  # reserved for billing metadata; crew size is fixed at 3
 
-    context_lines: list[str] = []
-    if target_audience and target_audience.strip():
-        context_lines.append(f"Target audience: {target_audience.strip()}")
-    if price_point and price_point.strip():
-        context_lines.append(f"Price point: {price_point.strip()}")
-    if marketing_budget and marketing_budget.strip():
-        context_lines.append(f"Marketing budget: {marketing_budget.strip()}")
-    context_block = ("\n".join(context_lines) + "\n\n") if context_lines else ""
+    model_tier = _resolve_model_tier_from_mix(model_mix)
+    context_block = (
+        f"Model mix: {model_mix:.0f}% Plus / {100 - model_mix:.0f}% Lite "
+        f"({agent_count} virtual agents requested).\n\n"
+    )
 
     openrouter_model = _resolve_simple_debate_model(model_tier)
     llm = build_crew_llm(openrouter_model, temperature=0.3, max_tokens=2048)
@@ -512,14 +513,17 @@ def orchestrate_debate(
     )
 
     logger.info(
-        "Starting simple debate crew (model=%s tier=%s agents=3)",
+        "Starting simple debate crew (model=%s tier=%s model_mix=%s agents=3)",
         openrouter_model,
         model_tier,
+        model_mix,
     )
 
     try:
         crew_result = crew.kickoff()
     except Exception as exc:
+        print("[orchestrate_debate] CrewAI kickoff crashed:")
+        print(traceback.format_exc())
         logger.exception("CrewAI orchestrate_debate failed")
         raise HTTPException(
             status_code=502,

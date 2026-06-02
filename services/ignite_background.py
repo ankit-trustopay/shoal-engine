@@ -227,10 +227,7 @@ def run_simple_debate_and_webhook(
     query: str,
     *,
     agent_count: int = 3,
-    model_tier: str = "lite",
-    target_audience: str | None = None,
-    price_point: str | None = None,
-    marketing_budget: str | None = None,
+    model_mix: float = 0,
 ) -> None:
     """
     Production 3-agent debate runner.
@@ -243,17 +240,14 @@ def run_simple_debate_and_webhook(
         result = orchestrate_debate(
             query,
             agent_count=agent_count,
-            model_tier=model_tier,
-            target_audience=target_audience,
-            price_point=price_point,
-            marketing_budget=marketing_budget,
+            model_mix=model_mix,
         )
 
         verdict = str(result["verdict"])
         confidence = int(result.get("confidence") or 0)
         research_text = str(result.get("research") or "")
         debate_text = str(result.get("debate") or "")
-        model_slug = str(result.get("model") or model_tier)
+        model_slug = str(result.get("model") or "lite")
 
         elapsed_sec = time.perf_counter() - started
         runtime = max(1, int(round(elapsed_sec)))
