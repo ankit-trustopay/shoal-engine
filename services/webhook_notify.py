@@ -40,6 +40,10 @@ def _resolve_webhook_url() -> str | None:
         if direct:
             return direct.rstrip("/")
 
+    base = os.getenv("SHOAL_WEB_URL", "").strip().rstrip("/")
+    if base:
+        return f"{base}/api/webhooks/engine"
+
     base = os.getenv("SHOAL_WEB_APP_URL", "").strip().rstrip("/")
     if base:
         return f"{base}/api/webhooks/engine"
@@ -109,6 +113,22 @@ def format_success_webhook_body(
     }
     # Flat duplicate so either parser branch succeeds.
     body.update(report_data)
+
+    # Additional compatibility payload (explicitly requested by QA/ops):
+    # { debate_id, status, verdict, agents, confidence }
+    # Keep swarmId/reportData as the canonical fields for shoal-web persistence.
+    body.update(
+        {
+            "debate_id": swarm_id,
+            "status": "completed",
+            "verdict": report_data.get("consensus")
+            or report_data.get("response")
+            or ignite_fields.get("response")
+            or "",
+            "agents": report_data.get("agentProfiles") or [],
+            "confidence": report_data.get("confidence") or 0,
+        }
+    )
     return _json_safe(body)
 
 
