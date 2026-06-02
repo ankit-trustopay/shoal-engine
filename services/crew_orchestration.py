@@ -51,42 +51,10 @@ Rules:
 - Do NOT include a confidence field (computed downstream).
 """
 
-LITE_WORKER_MODEL = "deepseek-v3"
-PLUS_WORKER_MODEL = "claude-3.5-sonnet"
-CEO_FIXED_MODEL = "gpt-4o"
-
-# CrewAI + OpenRouter: model id must include the openrouter/ prefix.
-SIMPLE_DEBATE_LITE_MODEL = "openrouter/meta-llama/llama-3-8b-instruct"
-SIMPLE_DEBATE_PLUS_MODEL = "openrouter/openai/gpt-4o-mini"
-
 CREWAI_FALLBACK_VERDICT = (
     "The swarm encountered a critical error during deliberation. "
     "Please check OpenRouter API keys and model names."
 )
-
-
-def _resolve_worker_model(model_tier: str | None) -> str:
-    tier = (model_tier or "lite").strip().lower()
-    return PLUS_WORKER_MODEL if tier == "plus" else LITE_WORKER_MODEL
-
-
-def _resolve_simple_debate_model(model_tier: str | None) -> str:
-    """OpenRouter model for the 3-agent production debate crew."""
-    tier = (model_tier or "lite").strip().lower()
-    return SIMPLE_DEBATE_PLUS_MODEL if tier == "plus" else SIMPLE_DEBATE_LITE_MODEL
-
-
-def _resolve_ceo_model(requested: str | None) -> str:
-    """
-    Keep the CEO on a frontier model regardless of worker tier.
-    If a caller explicitly requests a frontier model, honor it; otherwise default to gpt-4o.
-    """
-    if not requested:
-        return CEO_FIXED_MODEL
-    normalized = requested.strip().lower()
-    if "gpt-4o" in normalized or "claude-3.5" in normalized:
-        return requested
-    return CEO_FIXED_MODEL
 
 
 def _persona_worker_backstory(persona: DynamicPersona, premise: str) -> str:
@@ -106,10 +74,14 @@ def _persona_worker_backstory(persona: DynamicPersona, premise: str) -> str:
 def _build_worker_agents(
     personas: list[DynamicPersona],
     premise: str,
-    worker_model: str | None,
+    model_tier: str | None,
 ) -> list[Agent]:
     tavily_tool = build_tavily_search_tool()
-    worker_llm = build_crew_llm(worker_model, temperature=0.45, max_tokens=2048)
+    worker_llm = build_crew_llm(
+        model_tier=model_tier,
+        temperature=0.45,
+        max_tokens=2048,
+    )
     tools = [tavily_tool] if tavily_tool is not None else []
 
     agents: list[Agent] = []
@@ -265,10 +237,7 @@ def run_hierarchical_crew(
     Execute CrewAI hierarchical process and map outputs to Shoal contracts.
     """
     trimmed = premise.strip()
-    worker_model = _resolve_worker_model(model_tier)
-    ceo_model = _resolve_ceo_model(model)
-
-    agents = _build_worker_agents(personas, trimmed, worker_model)
+    agents = _build_worker_agents(personas, trimmed, model_tier)
     debate_tasks = _build_debate_tasks(
         personas,
         agents,
@@ -289,7 +258,11 @@ def run_hierarchical_crew(
     )
     all_tasks = [*debate_tasks, synthesis_task]
 
-    manager_llm = build_crew_llm(ceo_model, temperature=0.2, max_tokens=6000)
+    manager_llm = build_crew_llm(
+        model_tier="plus",
+        temperature=0.2,
+        max_tokens=6000,
+    )
 
     crew = Crew(
         agents=agents,

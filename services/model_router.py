@@ -6,32 +6,25 @@ import logging
 import os
 import re
 
+from services.openrouter_llm import LITE_MODEL, PLUS_MODEL
+
 logger = logging.getLogger(__name__)
 
-DEFAULT_OPENROUTER_MODEL = os.getenv(
-    "OPENROUTER_DEFAULT_MODEL",
-    "deepseek/deepseek-chat",
-)
+DEFAULT_OPENROUTER_MODEL = os.getenv("OPENROUTER_DEFAULT_MODEL", LITE_MODEL)
 
-FALLBACK_OPENROUTER_MODEL = os.getenv(
-    "OPENROUTER_FALLBACK_MODEL",
-    "openai/gpt-4o-mini",
-)
+FALLBACK_OPENROUTER_MODEL = os.getenv("OPENROUTER_FALLBACK_MODEL", PLUS_MODEL)
 
-# OpenRouter slugs for requested UI models
 OPENROUTER_MODEL_MAP: dict[str, str] = {
-    "meta-llama/llama-3-8b-instruct": "meta-llama/llama-3-8b-instruct",
-    "llama-3-8b-instruct": "meta-llama/llama-3-8b-instruct",
-    "llama-3": "meta-llama/llama-3-8b-instruct",
-    "gpt-4o": "openai/gpt-4o",
-    "gpt 4o": "openai/gpt-4o",
-    "gpt-4o (default)": "openai/gpt-4o",
-    "openai/gpt-4o": "openai/gpt-4o",
+    "lite": LITE_MODEL,
+    "gemma": LITE_MODEL,
+    "google/gemma-4-31b-it": LITE_MODEL,
+    "plus": PLUS_MODEL,
+    "deepseek": PLUS_MODEL,
+    "deepseek-v4-flash": PLUS_MODEL,
+    "deepseek/deepseek-v4-flash": PLUS_MODEL,
     "claude-3.5-sonnet": "anthropic/claude-3.5-sonnet",
-    "claude 3.5 sonnet": "anthropic/claude-3.5-sonnet",
     "anthropic/claude-3.5-sonnet": "anthropic/claude-3.5-sonnet",
     "deepseek-v3": "deepseek/deepseek-chat",
-    "deepseek v3": "deepseek/deepseek-chat",
     "deepseek/deepseek-chat": "deepseek/deepseek-chat",
     "deepseek/deepseek-v3": "deepseek/deepseek-v3",
 }

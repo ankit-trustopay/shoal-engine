@@ -9,18 +9,14 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import re
 from typing import Any, TypedDict
 
 from crewai import Agent, Crew, Process, Task
-from langchain_openai import ChatOpenAI
+
+from services.openrouter_llm import get_llm
 
 logger = logging.getLogger(__name__)
-
-OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-LITE_MODEL = "meta-llama/llama-3-8b-instruct"
-PLUS_MODEL = "openai/gpt-4o-mini"
 
 AGENT_NAMES = ("Market Researcher", "Skeptical Debater", "CEO Synthesizer")
 
@@ -67,24 +63,6 @@ def fallback_debate_result(reason: str | None = None) -> DebateResult:
             for name in AGENT_NAMES
         ],
     }
-
-
-def _resolve_model(model_mix: float) -> str:
-    return PLUS_MODEL if model_mix > 0 else LITE_MODEL
-
-
-def _build_openrouter_llm(model_mix: float) -> ChatOpenAI:
-    api_key = os.getenv("OPENROUTER_API_KEY", "").strip()
-    if not api_key:
-        raise RuntimeError("OPENROUTER_API_KEY is not configured")
-
-    return ChatOpenAI(
-        model=_resolve_model(model_mix),
-        base_url=OPENROUTER_BASE_URL,
-        api_key=api_key,
-        temperature=0.35,
-        max_tokens=2048,
-    )
 
 
 def _extract_json_object(text: str) -> dict[str, Any] | None:
@@ -173,7 +151,9 @@ def run_debate_crew(query: str, *, model_mix: float = 0) -> DebateResult:
         return fallback_debate_result("Missing query")
 
     try:
-        llm = _build_openrouter_llm(model_mix)
+        llm = get_llm(model_mix)
+        llm.temperature = 0.35
+        llm.max_tokens = 2048
     except Exception as exc:
         logger.exception("OpenRouter LLM setup failed")
         return fallback_debate_result(str(exc))

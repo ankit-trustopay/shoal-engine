@@ -1,44 +1,37 @@
-"""CrewAI LLM instances routed through OpenRouter."""
+"""CrewAI-compatible LLM instances routed through OpenRouter (ChatOpenAI)."""
 
 from __future__ import annotations
 
-import os
+from langchain_openai import ChatOpenAI
 
-from crewai import LLM
-
-from services.model_router import resolve_openrouter_model
-
-OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+from services.openrouter_llm import get_llm
 
 
-def _openrouter_model_id(requested: str | None) -> str:
-    """
-    CrewAI requires the openrouter/ provider prefix when using OpenRouter.
-    Examples:
-      - openrouter/meta-llama/llama-3-8b-instruct
-      - openrouter/openai/gpt-4o-mini
-    """
-    slug = resolve_openrouter_model(requested)
-    normalized = slug.strip()
-    if normalized.startswith("openrouter/"):
-        return normalized
-    return f"openrouter/{normalized}"
+def _model_mix_from_tier(model_tier: str | None) -> int:
+    return 100 if (model_tier or "").strip().lower() == "plus" else 0
 
 
 def build_crew_llm(
     requested_model: str | None = None,
     *,
+    model_tier: str | None = None,
+    model_mix: float | int | None = None,
     temperature: float = 0.25,
     max_tokens: int = 4096,
-) -> LLM:
-    api_key = os.getenv("OPENROUTER_API_KEY", "").strip()
-    if not api_key:
-        raise RuntimeError("OPENROUTER_API_KEY is not configured")
+) -> ChatOpenAI:
+    """
+    Build a LangChain ChatOpenAI client for CrewAI agents.
 
-    return LLM(
-        model=_openrouter_model_id(requested_model),
-        base_url=OPENROUTER_BASE_URL,
-        api_key=api_key,
-        temperature=temperature,
-        max_tokens=max_tokens,
-    )
+    requested_model is accepted for API compatibility; tier/mix select Gemma vs DeepSeek.
+    """
+    _ = requested_model
+
+    if model_mix is not None:
+        mix = int(model_mix)
+    else:
+        mix = _model_mix_from_tier(model_tier)
+
+    llm = get_llm(mix)
+    llm.temperature = temperature
+    llm.max_tokens = max_tokens
+    return llm
