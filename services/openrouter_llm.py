@@ -18,17 +18,25 @@ OPENROUTER_DEFAULT_HEADERS = {
 
 def get_llm(model_mix: float | int) -> ChatOpenAI:
     """
-    If model_mix is low (e.g., 0), use Lite (Gemma). If high (>50), use Plus (DeepSeek).
+    If model_mix <= 50, use Lite (Gemma). If > 50, use Plus (DeepSeek).
     """
-    model_name = PLUS_MODEL if int(model_mix) > 50 else LITE_MODEL
+    mix = int(model_mix)
+    model_name = PLUS_MODEL if mix > 50 else LITE_MODEL
 
     api_key = os.environ.get("OPENROUTER_API_KEY")
     if not api_key or not str(api_key).strip():
         raise RuntimeError("OPENROUTER_API_KEY is not configured")
+
+    print(
+        f"[openrouter_llm] init model={model_name} model_mix={mix} "
+        f"base={OPENROUTER_API_BASE}",
+    )
 
     return ChatOpenAI(
         openai_api_key=api_key,
         openai_api_base=OPENROUTER_API_BASE,
         model_name=model_name,
         default_headers=OPENROUTER_DEFAULT_HEADERS,
+        temperature=0.35,
+        max_tokens=2048,
     )

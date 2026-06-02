@@ -13,16 +13,12 @@ from typing import Any, TypedDict
 
 from crewai import Agent, Crew, Process, Task
 
+from services.debate_constants import AI_MODEL_ERROR_VERDICT
 from services.openrouter_llm import get_llm
 
 logger = logging.getLogger(__name__)
 
 AGENT_NAMES = ("Market Researcher", "Skeptical Debater", "CEO Synthesizer")
-
-FALLBACK_VERDICT = (
-    "The deliberation engine could not produce a verdict. "
-    "Verify OPENROUTER_API_KEY and model availability, then retry."
-)
 
 VERDICT_TASK_SPEC = """
 Write your response as PLAIN TEXT only (no markdown code fences).
@@ -39,9 +35,6 @@ AGENT POSITIONS:
 Market Researcher: <one sentence stance>
 Skeptical Debater: <one sentence stance>
 CEO Synthesizer: <one sentence synthesis>
-
-Optional: after the above, you may append a JSON block matching:
-{"verdict":"...","confidence":0,"agents":[{"name":"...","position":"..."}]}
 """
 
 
@@ -56,21 +49,20 @@ class DebateResult(TypedDict):
     agents: list[DebateAgent]
 
 
-def fallback_debate_result(
-    reason: str | None = None,
-    *,
-    raw_dump: str | None = None,
-) -> DebateResult:
-    detail = (reason or "Engine error").strip()[:200]
-    verdict = FALLBACK_VERDICT
-    if detail:
-        verdict = f"{FALLBACK_VERDICT} ({detail})"
-    if raw_dump and raw_dump.strip():
-        excerpt = raw_dump.strip()[:1200]
-        verdict = f"{verdict}\n\nRaw engine output:\n{excerpt}"
+def ensure_verdict(text: str | None) -> str:
+    """Never allow an empty verdict string to leave the engine."""
+    cleaned = (text or "").strip()
+    if not cleaned:
+        print("[debate_crew] ensure_verdict: empty -> AI_MODEL_ERROR_VERDICT")
+        return AI_MODEL_ERROR_VERDICT
+    return cleaned
 
+
+def fallback_debate_result(reason: str | None = None) -> DebateResult:
+    if reason:
+        print(f"[debate_crew] fallback_debate_result: {reason[:300]}")
     return {
-        "verdict": verdict,
+        "verdict": AI_MODEL_ERROR_VERDICT,
         "confidence": 0,
         "agents": [
             {
@@ -79,6 +71,30 @@ def fallback_debate_result(
             }
             for name in AGENT_NAMES
         ],
+    }
+
+
+def finalize_debate_result(result: DebateResult) -> DebateResult:
+    """Guarantee non-empty verdict and agent list before webhook."""
+    verdict = ensure_verdict(result.get("verdict"))
+    agents = list(result.get("agents") or [])
+    if not agents:
+        agents = [
+            {
+                "name": "CEO Synthesizer",
+                "position": verdict[:500],
+            },
+        ]
+    confidence_raw = result.get("confidence", 0)
+    confidence = (
+        int(max(0, min(100, round(float(confidence_raw)))))
+        if isinstance(confidence_raw, (int, float))
+        else 0
+    )
+    return {
+        "verdict": verdict,
+        "confidence": confidence,
+        "agents": agents,
     }
 
 
@@ -143,15 +159,7 @@ def _extract_json_object(text: str) -> dict[str, Any] | None:
         except json.JSONDecodeError:
             continue
 
-    match = re.search(r"\{[\s\S]*\}", raw)
-    if not match:
-        return None
-
-    try:
-        parsed = json.loads(match.group(0))
-        return parsed if isinstance(parsed, dict) else None
-    except json.JSONDecodeError:
-        return None
+    return None
 
 
 def _parse_plaintext_verdict(text: str) -> tuple[str, int, list[DebateAgent]]:
@@ -171,11 +179,7 @@ def _parse_plaintext_verdict(text: str) -> tuple[str, int, list[DebateAgent]]:
     if verdict_match:
         verdict = verdict_match.group(1).strip()
 
-    conf_match = re.search(
-        r"CONFIDENCE:\s*(\d{1,3})",
-        raw,
-        re.IGNORECASE,
-    )
+    conf_match = re.search(r"CONFIDENCE:\s*(\d{1,3})", raw, re.IGNORECASE)
     if conf_match:
         confidence = int(max(0, min(100, int(conf_match.group(1)))))
 
@@ -199,7 +203,7 @@ def _parse_plaintext_verdict(text: str) -> tuple[str, int, list[DebateAgent]]:
         if candidate and len(candidate) > 20:
             verdict = candidate
 
-    if not verdict and len(raw) > 0:
+    if not verdict and raw:
         verdict = raw[:2000].strip()
 
     return verdict, confidence, agents
@@ -210,15 +214,15 @@ def _agents_from_task_texts(task_texts: list[str]) -> list[DebateAgent]:
         return [
             {
                 "name": AGENT_NAMES[0],
-                "position": (task_texts[0][:500] or "Research completed."),
+                "position": task_texts[0][:500] or "Research completed.",
             },
             {
                 "name": AGENT_NAMES[1],
-                "position": (task_texts[1][:500] or "Debate completed."),
+                "position": task_texts[1][:500] or "Debate completed.",
             },
             {
                 "name": AGENT_NAMES[2],
-                "position": (task_texts[2][:500] or "Synthesis completed."),
+                "position": task_texts[2][:500] or "Synthesis completed.",
             },
         ]
     return []
@@ -269,6 +273,10 @@ def _build_result_from_outputs(
     final_text: str,
 ) -> DebateResult:
     combined = "\n\n".join(task_texts) if task_texts else final_text
+    print(
+        f"[debate_crew] build_result final_len={len(final_text)} "
+        f"tasks={len(task_texts)}",
+    )
 
     parsed = _extract_json_object(final_text) or _extract_json_object(combined)
 
@@ -301,19 +309,19 @@ def _build_result_from_outputs(
         verdict = final_text.strip() or combined.strip()
 
     if not verdict.strip():
-        return fallback_debate_result(
-            "Empty synthesis output",
-            raw_dump=combined[:2000] if combined else None,
-        )
+        print("[debate_crew] build_result: no verdict text after all parsers")
+        return fallback_debate_result("Empty synthesis output")
 
     if confidence == 0:
         confidence = 50
 
-    return {
-        "verdict": verdict.strip(),
-        "confidence": confidence,
-        "agents": agents,
-    }
+    return finalize_debate_result(
+        {
+            "verdict": verdict.strip(),
+            "confidence": confidence,
+            "agents": agents,
+        },
+    )
 
 
 def run_debate_crew(query: str, *, model_mix: float = 0) -> DebateResult:
@@ -321,16 +329,17 @@ def run_debate_crew(query: str, *, model_mix: float = 0) -> DebateResult:
     Run a sequential 3-agent crew and return normalized debate JSON.
     Never raises — returns fallback JSON on any failure.
     """
+    print(f"[debate_crew] run_debate_crew start model_mix={model_mix}")
+
     trimmed = (query or "").strip()
     if not trimmed:
         return fallback_debate_result("Missing query")
 
     try:
         llm = get_llm(model_mix)
-        llm.temperature = 0.35
-        llm.max_tokens = 2048
     except Exception as exc:
         logger.exception("OpenRouter LLM setup failed")
+        print(f"[debate_crew] LLM init failed: {exc}")
         return fallback_debate_result(str(exc))
 
     researcher = Agent(
@@ -404,23 +413,33 @@ def run_debate_crew(query: str, *, model_mix: float = 0) -> DebateResult:
     )
 
     try:
+        print("[debate_crew] crew.kickoff() …")
         crew_result = crew.kickoff()
+        print("[debate_crew] crew.kickoff() done")
     except Exception as exc:
         logger.exception("CrewAI debate kickoff failed")
+        print(f"[debate_crew] kickoff failed: {exc}")
         return fallback_debate_result(str(exc))
 
-    task_texts = _gather_crew_texts(crew_result)
-    final_text = task_texts[-1] if task_texts else ""
-
-    if not final_text.strip():
-        logger.error("Debate crew returned empty final output; texts=%s", task_texts)
-        return fallback_debate_result(
-            "Empty crew output",
-            raw_dump="\n---\n".join(task_texts)[:2000] if task_texts else None,
+    try:
+        task_texts = _gather_crew_texts(crew_result)
+        final_text = task_texts[-1] if task_texts else ""
+        print(
+            f"[debate_crew] gathered outputs tasks={len(task_texts)} "
+            f"final_len={len(final_text)}",
         )
 
-    try:
-        return _build_result_from_outputs(task_texts, final_text)
+        if not final_text.strip():
+            print("[debate_crew] empty final output")
+            return fallback_debate_result("Empty crew output")
+
+        result = _build_result_from_outputs(task_texts, final_text)
+        print(
+            f"[debate_crew] success verdict_len={len(result['verdict'])} "
+            f"confidence={result['confidence']}",
+        )
+        return finalize_debate_result(result)
     except Exception as exc:
         logger.exception("Failed to normalize debate output")
-        return fallback_debate_result(str(exc), raw_dump=final_text[:2000])
+        print(f"[debate_crew] normalize failed: {exc}")
+        return fallback_debate_result(str(exc))

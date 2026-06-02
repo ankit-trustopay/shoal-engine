@@ -9,7 +9,13 @@ from typing import Any
 
 from fastapi import HTTPException
 
-from services.debate_crew import fallback_debate_result, run_debate_crew
+from services.debate_constants import AI_MODEL_ERROR_VERDICT
+from services.debate_crew import (
+    ensure_verdict,
+    fallback_debate_result,
+    finalize_debate_result,
+    run_debate_crew,
+)
 from services.dynamic_personas import clamp_agent_count
 from services.metrics import compute_strict_confidence, compute_swarm_credits
 from services.orchestrator import run_swarm_ignite
@@ -156,10 +162,7 @@ def run_crew_and_webhook(
     price_point: str | None = None,
     marketing_budget: str | None = None,
 ) -> None:
-    """
-    Sync entrypoint for FastAPI BackgroundTasks.
-    Runs CrewAI, then POSTs the ignite payload to the Next.js engine webhook.
-    """
+    """Sync entrypoint for FastAPI BackgroundTasks (ignite path)."""
     started = time.perf_counter()
     debate_count = clamp_agent_count(agent_count)
     resolved_swarm_size = swarm_size or debate_count
@@ -191,11 +194,7 @@ def run_crew_and_webhook(
         if not ignite_fields.get("messages"):
             raise ValueError("CrewAI returned no debate messages")
 
-        logger.info(
-            "CrewAI complete for swarm %s (runtime=%ss); posting webhook",
-            swarm_id,
-            runtime,
-        )
+        print(f"[ignite_background] posting ignite webhook swarm={swarm_id}")
         notify_swarm_success(swarm_id, ignite_fields)
 
     except Exception as exc:
@@ -211,16 +210,15 @@ def run_simple_debate_and_webhook(
     agent_count: int = 3,
     model_mix: float = 0,
 ) -> None:
-    """
-    Run the production debate crew and POST canonical JSON to shoal-web.
-    Always delivers a payload (including engine-side fallbacks).
-    """
+    """Run debate crew and POST canonical JSON to shoal-web."""
+    print(f"[ignite_background] debate start id={debate_id} model_mix={model_mix}")
     started = time.perf_counter()
 
     try:
-        result = run_debate_crew(query, model_mix=model_mix)
+        result = finalize_debate_result(run_debate_crew(query, model_mix=model_mix))
     except Exception as exc:
         logger.exception("Debate crew unexpected failure for %s", debate_id)
+        print(f"[ignite_background] debate exception: {exc}")
         result = fallback_debate_result(str(exc))
 
     elapsed_sec = time.perf_counter() - started
@@ -228,18 +226,15 @@ def run_simple_debate_and_webhook(
     billed_agents = max(3, agent_count)
     cost = float(compute_swarm_credits(billed_agents))
 
-    verdict = str(result.get("verdict") or "").strip()
-    if not verdict:
-        verdict = (
-            "Deliberation completed but the synthesizer returned an empty verdict. "
-            "See agent positions below."
-        )
-
+    verdict = ensure_verdict(str(result.get("verdict") or ""))
     agents = list(result.get("agents") or [])
     if not agents:
-        agents = [
-            {"name": "CEO Synthesizer", "position": verdict[:500]},
-        ]
+        agents = [{"name": "CEO Synthesizer", "position": AI_MODEL_ERROR_VERDICT}]
+
+    print(
+        f"[ignite_background] webhook debate_id={debate_id} "
+        f"verdict_len={len(verdict)} agents={len(agents)}",
+    )
 
     notify_debate_completion(
         debate_id,

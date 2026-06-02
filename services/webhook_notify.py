@@ -9,6 +9,8 @@ from typing import Any
 
 import requests
 
+from services.debate_constants import AI_MODEL_ERROR_VERDICT
+
 logger = logging.getLogger(__name__)
 
 WEBHOOK_TIMEOUT_SECONDS = 15
@@ -99,10 +101,11 @@ def notify_debate_completion(
 
     safe_verdict = (verdict or "").strip()
     if not safe_verdict:
-        safe_verdict = (
-            "Deliberation completed without a parsed verdict string. "
-            "Check engine logs for raw agent output."
+        print(
+            f"[webhook] empty verdict for debate {debate_id} -> "
+            f"{AI_MODEL_ERROR_VERDICT!r}",
         )
+        safe_verdict = AI_MODEL_ERROR_VERDICT
     safe_confidence = int(max(0, min(100, confidence)))
     safe_agents = [
         {
