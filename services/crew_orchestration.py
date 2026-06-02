@@ -55,9 +55,14 @@ LITE_WORKER_MODEL = "deepseek-v3"
 PLUS_WORKER_MODEL = "claude-3.5-sonnet"
 CEO_FIXED_MODEL = "gpt-4o"
 
-# Production simple-debate models (OpenRouter slugs)
-SIMPLE_DEBATE_LITE_MODEL = "meta-llama/llama-3-8b-instruct"
-SIMPLE_DEBATE_PLUS_MODEL = "openai/gpt-4o"
+# CrewAI + OpenRouter: model id must include the openrouter/ prefix.
+SIMPLE_DEBATE_LITE_MODEL = "openrouter/meta-llama/llama-3-8b-instruct"
+SIMPLE_DEBATE_PLUS_MODEL = "openrouter/openai/gpt-4o-mini"
+
+CREWAI_FALLBACK_VERDICT = (
+    "The swarm encountered a critical error during deliberation. "
+    "Please check OpenRouter API keys and model names."
+)
 
 
 def _resolve_worker_model(model_tier: str | None) -> str:
@@ -416,8 +421,9 @@ def orchestrate_debate(
         f"({agent_count} virtual agents requested).\n\n"
     )
 
-    openrouter_model = _resolve_simple_debate_model(model_tier)
-    llm = build_crew_llm(openrouter_model, temperature=0.3, max_tokens=2048)
+    crewai_model_id = _resolve_simple_debate_model(model_tier)
+    logger.info("CrewAI OpenRouter model id: %s", crewai_model_id)
+    llm = build_crew_llm(crewai_model_id, temperature=0.3, max_tokens=2048)
     tavily_tool = build_tavily_search_tool()
     research_tools = [tavily_tool] if tavily_tool is not None else []
 
@@ -514,21 +520,24 @@ def orchestrate_debate(
 
     logger.info(
         "Starting simple debate crew (model=%s tier=%s model_mix=%s agents=3)",
-        openrouter_model,
+        crewai_model_id,
         model_tier,
         model_mix,
     )
 
     try:
         crew_result = crew.kickoff()
-    except Exception as exc:
-        print("[orchestrate_debate] CrewAI kickoff crashed:")
+    except Exception as e:
+        print(f"CREWAI ERROR: {str(e)}")
         print(traceback.format_exc())
         logger.exception("CrewAI orchestrate_debate failed")
-        raise HTTPException(
-            status_code=502,
-            detail=f"CrewAI debate failed: {exc}",
-        ) from exc
+        return {
+            "verdict": CREWAI_FALLBACK_VERDICT,
+            "research": "",
+            "debate": "",
+            "confidence": 0,
+            "model": crewai_model_id,
+        }
 
     task_texts = _extract_sequential_task_outputs(crew_result, 3)
     research_output = task_texts[0]
@@ -536,7 +545,13 @@ def orchestrate_debate(
     verdict = task_texts[2] or str(getattr(crew_result, "raw", crew_result) or "").strip()
 
     if not verdict:
-        raise HTTPException(status_code=502, detail="CrewAI returned empty verdict")
+        return {
+            "verdict": CREWAI_FALLBACK_VERDICT,
+            "research": research_output,
+            "debate": debate_output,
+            "confidence": 0,
+            "model": crewai_model_id,
+        }
 
     from services.metrics import AgentSentiment, compute_strict_confidence
 
@@ -552,5 +567,5 @@ def orchestrate_debate(
         "research": research_output,
         "debate": debate_output,
         "confidence": confidence,
-        "model": openrouter_model,
+        "model": crewai_model_id,
     }

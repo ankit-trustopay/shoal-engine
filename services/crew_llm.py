@@ -12,10 +12,17 @@ OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 
 
 def _openrouter_model_id(requested: str | None) -> str:
+    """
+    CrewAI requires the openrouter/ provider prefix when using OpenRouter.
+    Examples:
+      - openrouter/meta-llama/llama-3-8b-instruct
+      - openrouter/openai/gpt-4o-mini
+    """
     slug = resolve_openrouter_model(requested)
-    if slug.startswith("openrouter/"):
-        return slug
-    return f"openrouter/{slug}"
+    normalized = slug.strip()
+    if normalized.startswith("openrouter/"):
+        return normalized
+    return f"openrouter/{normalized}"
 
 
 def build_crew_llm(
