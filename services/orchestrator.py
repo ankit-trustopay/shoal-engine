@@ -28,6 +28,11 @@ async def run_swarm_ignite(
     premise: str,
     agent_count: int,
     model: str | None = None,
+    *,
+    model_tier: str | None = None,
+    target_audience: str | None = None,
+    price_point: str | None = None,
+    marketing_budget: str | None = None,
 ) -> SwarmIgniteResult:
     """
     Deep research → adversarial personas → CrewAI hierarchical debate → CEO JSON synthesis.
@@ -51,6 +56,7 @@ async def run_swarm_ignite(
         web_data,
         debate_count,
         model=model,
+        target_audience=target_audience,
     )
 
     manager_synthesis, debate_transcript, messages = await asyncio.to_thread(
@@ -60,6 +66,10 @@ async def run_swarm_ignite(
         web_data,
         evidence,
         model,
+        model_tier=model_tier,
+        target_audience=target_audience,
+        price_point=price_point,
+        marketing_budget=marketing_budget,
     )
 
     agent_profiles = [persona_to_agent_profile(persona) for persona in personas]

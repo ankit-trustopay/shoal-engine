@@ -50,6 +50,28 @@ Rules:
 - Do NOT include a confidence field (computed downstream).
 """
 
+LITE_WORKER_MODEL = "deepseek-v3"
+PLUS_WORKER_MODEL = "claude-3.5-sonnet"
+CEO_FIXED_MODEL = "gpt-4o"
+
+
+def _resolve_worker_model(model_tier: str | None) -> str:
+    tier = (model_tier or "lite").strip().lower()
+    return PLUS_WORKER_MODEL if tier == "plus" else LITE_WORKER_MODEL
+
+
+def _resolve_ceo_model(requested: str | None) -> str:
+    """
+    Keep the CEO on a frontier model regardless of worker tier.
+    If a caller explicitly requests a frontier model, honor it; otherwise default to gpt-4o.
+    """
+    if not requested:
+        return CEO_FIXED_MODEL
+    normalized = requested.strip().lower()
+    if "gpt-4o" in normalized or "claude-3.5" in normalized:
+        return requested
+    return CEO_FIXED_MODEL
+
 
 def _persona_worker_backstory(persona: DynamicPersona, premise: str) -> str:
     return (
@@ -68,10 +90,10 @@ def _persona_worker_backstory(persona: DynamicPersona, premise: str) -> str:
 def _build_worker_agents(
     personas: list[DynamicPersona],
     premise: str,
-    model: str | None,
+    worker_model: str | None,
 ) -> list[Agent]:
     tavily_tool = build_tavily_search_tool()
-    worker_llm = build_crew_llm(model, temperature=0.45, max_tokens=2048)
+    worker_llm = build_crew_llm(worker_model, temperature=0.45, max_tokens=2048)
     tools = [tavily_tool] if tavily_tool is not None else []
 
     agents: list[Agent] = []
@@ -98,9 +120,28 @@ def _build_debate_tasks(
     agents: list[Agent],
     premise: str,
     web_data: str,
+    *,
+    target_audience: str | None,
+    price_point: str | None,
+    marketing_budget: str | None,
 ) -> list[Task]:
     tasks: list[Task] = []
     prior_context: list[Task] = []
+
+    context_clause_parts: list[str] = []
+    if target_audience and target_audience.strip():
+        context_clause_parts.append(f"target audience is {target_audience.strip()}")
+    if price_point and price_point.strip():
+        context_clause_parts.append(f"price point is {price_point.strip()}")
+    if marketing_budget and marketing_budget.strip():
+        context_clause_parts.append(f"marketing budget is {marketing_budget.strip()}")
+    context_clause = ""
+    if context_clause_parts:
+        context_clause = (
+            "Debate this idea keeping in mind: "
+            + "; ".join(context_clause_parts)
+            + "."
+        )
 
     for index, (persona, agent) in enumerate(zip(personas, agents)):
         prior_names = [personas[i]["name"] for i in range(index)]
@@ -113,6 +154,9 @@ def _build_debate_tasks(
 
         description = (
             f"USER PREMISE:\n{premise}\n\n"
+            f"{context_clause}\n\n" if context_clause else f"USER PREMISE:\n{premise}\n\n"
+        )
+        description += (
             f"PRE-SCRAPED CONTEXT:\n{web_data[:6000]}\n\n"
             f"You are {persona['name']} ({persona['role']}). {prior_clause}\n"
             "1) Use Tavily search for fresh evidence.\n"
@@ -142,11 +186,24 @@ def _build_synthesis_task(
     personas: list[DynamicPersona],
     debate_tasks: list[Task],
     web_data: str,
+    *,
+    target_audience: str | None,
+    price_point: str | None,
+    marketing_budget: str | None,
 ) -> Task:
     roles = ", ".join(p["role"] for p in personas)
+    modifiers: list[str] = []
+    if target_audience and target_audience.strip():
+        modifiers.append(f"Target audience: {target_audience.strip()}")
+    if price_point and price_point.strip():
+        modifiers.append(f"Price point: {price_point.strip()}")
+    if marketing_budget and marketing_budget.strip():
+        modifiers.append(f"Marketing budget: {marketing_budget.strip()}")
+    modifier_block = ("\n".join(modifiers) + "\n\n") if modifiers else ""
     return Task(
         description=(
             f"USER PREMISE:\n{premise}\n\n"
+            f"{modifier_block}"
             f"WEB CONTEXT:\n{web_data[:6000]}\n\n"
             f"Worker roles: {roles}.\n"
             "Review every delegated debate turn and compile the final institutional package.\n"
@@ -182,17 +239,41 @@ def run_hierarchical_crew(
     web_data: str,
     evidence: list[EvidenceItem],
     model: str | None,
+    *,
+    model_tier: str | None = None,
+    target_audience: str | None = None,
+    price_point: str | None = None,
+    marketing_budget: str | None = None,
 ) -> tuple[ManagerSynthesis, list, list[dict[str, str]]]:
     """
     Execute CrewAI hierarchical process and map outputs to Shoal contracts.
     """
     trimmed = premise.strip()
-    agents = _build_worker_agents(personas, trimmed, model)
-    debate_tasks = _build_debate_tasks(personas, agents, trimmed, web_data)
-    synthesis_task = _build_synthesis_task(trimmed, personas, debate_tasks, web_data)
+    worker_model = _resolve_worker_model(model_tier)
+    ceo_model = _resolve_ceo_model(model)
+
+    agents = _build_worker_agents(personas, trimmed, worker_model)
+    debate_tasks = _build_debate_tasks(
+        personas,
+        agents,
+        trimmed,
+        web_data,
+        target_audience=target_audience,
+        price_point=price_point,
+        marketing_budget=marketing_budget,
+    )
+    synthesis_task = _build_synthesis_task(
+        trimmed,
+        personas,
+        debate_tasks,
+        web_data,
+        target_audience=target_audience,
+        price_point=price_point,
+        marketing_budget=marketing_budget,
+    )
     all_tasks = [*debate_tasks, synthesis_task]
 
-    manager_llm = build_crew_llm(model, temperature=0.2, max_tokens=6000)
+    manager_llm = build_crew_llm(ceo_model, temperature=0.2, max_tokens=6000)
 
     crew = Crew(
         agents=agents,

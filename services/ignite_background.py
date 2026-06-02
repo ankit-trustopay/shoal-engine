@@ -181,6 +181,10 @@ def run_crew_and_webhook(
                 premise,
                 agent_count=debate_count,
                 model=model,
+                model_tier=model_tier,
+                target_audience=target_audience,
+                price_point=price_point,
+                marketing_budget=marketing_budget,
             )
         )
 

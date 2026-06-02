@@ -257,6 +257,7 @@ def _build_generation_prompt(
     premise: str,
     web_data: str,
     agent_count: int,
+    target_audience: str | None = None,
 ) -> str:
     archetypes = selected_archetypes(agent_count)
     hints = _premise_hints(premise)
@@ -265,8 +266,15 @@ def _build_generation_prompt(
         for index, item in enumerate(archetypes)
     )
 
+    audience_clause = (
+        f"Target audience to optimize for: {target_audience.strip()}\n\n"
+        if target_audience and target_audience.strip()
+        else ""
+    )
+
     return (
         f"User dilemma:\n{premise.strip()}\n\n"
+        f"{audience_clause}"
         f"Context hints: {hints or 'Infer locale and domain from the dilemma.'}\n\n"
         f"Optional web context:\n{web_data[:1200]}\n\n"
         f"Generate EXACTLY {len(archetypes)} persona objects for these fixed adversarial slots:\n"
@@ -288,12 +296,18 @@ async def generate_dynamic_personas(
     web_data: str,
     agent_count: int,
     model: str | None = None,
+    target_audience: str | None = None,
 ) -> list[DynamicPersona]:
     """Generate exactly agent_count adversarial personas with conflicting mandates."""
     trimmed = premise.strip()
     count = clamp_agent_count(agent_count)
     archetypes = selected_archetypes(count)
-    user_prompt = _build_generation_prompt(trimmed, web_data, count)
+    user_prompt = _build_generation_prompt(
+        trimmed,
+        web_data,
+        count,
+        target_audience=target_audience,
+    )
 
     try:
         raw_text, model_used = await chat_completion_with_fallback(
