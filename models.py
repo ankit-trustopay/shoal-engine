@@ -91,9 +91,10 @@ class DebateAgentPosition(BaseModel):
 
 
 class ExecutiveSummary(BaseModel):
-    """Top hero: BUY | WAIT | PIVOT + fit + reason."""
+    """Top hero: BUY | WAIT | PIVOT + confidence + fit + reason."""
 
     recommendation: Literal["BUY", "WAIT", "PIVOT"]
+    confidence: int = Field(..., ge=0, le=100)
     fit_for_you: Literal["Excellent", "Good", "Weak"] = Field(alias="fitForYou")
     one_line_reason: str = Field(..., min_length=1, alias="oneLineReason")
 
@@ -186,7 +187,7 @@ class EvidenceVault(BaseModel):
 
 
 class DebateCompletionPayload(BaseModel):
-    """Canonical debate webhook body from the Python engine."""
+    """Canonical debate webhook body from the Python engine (7-zone boardroom)."""
 
     debate_id: str = Field(..., min_length=1)
     status: Literal["completed", "failed", "failure"] = "completed"
@@ -197,15 +198,23 @@ class DebateCompletionPayload(BaseModel):
     friction_matrix: list[FrictionMatrixEntry] = Field(..., min_length=1, max_length=50)
     pre_mortem: PreMortem
     execution_roadmap: ExecutionRoadmap
-    executive_summary: ExecutiveSummary = Field(alias="executiveSummary")
-    boardroom_summary: BoardroomSummary = Field(alias="boardroomSummary")
-    debate_room: list[DebateRoomAgent] = Field(..., min_length=1, alias="debateRoom")
-    evidence_vault: EvidenceVault = Field(alias="evidenceVault")
+    executive_summary: ExecutiveSummary
+    boardroom_summary: BoardroomSummary
+    debate_room: list[DebateRoomAgent] = Field(..., min_length=1)
+    evidence_vault: EvidenceVault
     runtime: int = Field(default=1, ge=1)
     cost: float = Field(default=0, ge=0)
     agent_count: int = Field(default=3, ge=1, alias="agentCount")
 
     model_config = {"populate_by_name": True}
+
+    @model_validator(mode="after")
+    def sync_executive_confidence(self) -> Self:
+        if self.executive_summary.confidence != self.confidence:
+            self.executive_summary = self.executive_summary.model_copy(
+                update={"confidence": self.confidence},
+            )
+        return self
 
     @field_validator("tldr")
     @classmethod

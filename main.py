@@ -9,7 +9,7 @@ from services.debate_constants import AI_MODEL_ERROR_VERDICT
 from services.debate_crew import fallback_debate_result, finalize_debate_result
 from services.ignite_background import run_crew_and_webhook, run_simple_debate_and_webhook
 from services.metrics import compute_swarm_credits
-from services.webhook_notify import notify_debate_completion
+from services.webhook_notify import notify_debate_completion_from_result
 
 load_dotenv()
 
@@ -99,16 +99,9 @@ def _run_debate_crew_and_webhook(
         print(f"[main] background debate worker FAILED id={debate_id}: {exc}")
         fallback = finalize_debate_result(fallback_debate_result(str(exc)))
         cost = float(compute_swarm_credits(max(3, agent_count)))
-        notify_debate_completion(
+        notify_debate_completion_from_result(
             debate_id,
-            verdict=fallback["verdict"] or AI_MODEL_ERROR_VERDICT,
-            confidence=int(fallback["confidence"]),
-            agents=list(fallback["agents"]),
-            tldr=list(fallback.get("tldr") or []),
-            friction_matrix=list(fallback.get("friction_matrix") or []),
-            pre_mortem=fallback.get("pre_mortem"),
-            execution_roadmap=fallback.get("execution_roadmap"),
-            evidence=list(fallback.get("evidence") or []),
+            fallback,
             runtime=1,
             cost=cost,
             agent_count=max(3, agent_count),

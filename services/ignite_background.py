@@ -19,7 +19,11 @@ from services.debate_crew import (
 from services.dynamic_personas import clamp_agent_count
 from services.metrics import compute_strict_confidence, compute_swarm_credits
 from services.orchestrator import run_swarm_ignite
-from services.webhook_notify import notify_debate_completion, notify_swarm_failure, notify_swarm_success
+from services.webhook_notify import (
+    notify_debate_completion_from_result,
+    notify_swarm_failure,
+    notify_swarm_success,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -215,13 +219,13 @@ def run_simple_debate_and_webhook(
     started = time.perf_counter()
 
     try:
-        result = finalize_debate_result(
-            run_debate_crew(query, agent_count=agent_count),
-        )
+        result = run_debate_crew(query, agent_count=agent_count)
     except Exception as exc:
         logger.exception("Debate crew unexpected failure for %s", debate_id)
         print(f"[ignite_background] debate exception: {exc}")
         result = fallback_debate_result(str(exc))
+
+    result = finalize_debate_result(result)
 
     elapsed_sec = time.perf_counter() - started
     runtime = max(1, int(round(elapsed_sec)))
@@ -229,29 +233,17 @@ def run_simple_debate_and_webhook(
     cost = float(compute_swarm_credits(billed_agents))
 
     verdict = ensure_verdict(str(result.get("verdict") or ""))
-    agents = list(result.get("agents") or [])
-    if not agents:
-        agents = [{"name": "CEO Synthesizer", "position": AI_MODEL_ERROR_VERDICT}]
+    debate_room = list(result.get("debate_room") or [])
 
     print(
         f"[ignite_background] webhook debate_id={debate_id} "
-        f"verdict_len={len(verdict)} agents={len(agents)}",
+        f"verdict_len={len(verdict)} debate_room={len(debate_room)} "
+        f"has_executive_summary={bool(result.get('executive_summary'))}",
     )
 
-    notify_debate_completion(
+    notify_debate_completion_from_result(
         debate_id,
-        verdict=verdict,
-        confidence=int(result.get("confidence") or 0),
-        agents=agents,
-        tldr=list(result.get("tldr") or []),
-        friction_matrix=list(result.get("friction_matrix") or []),
-        pre_mortem=result.get("pre_mortem"),
-        execution_roadmap=result.get("execution_roadmap"),
-        evidence=list(result.get("evidence") or []),
-        executive_summary=result.get("executive_summary"),
-        boardroom_summary=result.get("boardroom_summary"),
-        debate_room=list(result.get("debate_room") or []),
-        evidence_vault=result.get("evidence_vault"),
+        result,
         runtime=runtime,
         cost=cost,
         agent_count=billed_agents,

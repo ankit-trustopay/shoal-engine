@@ -235,8 +235,13 @@ async def _run_turn2_ceo(
         f"friction_matrix MUST contain EXACTLY {worker_count} entries "
         f"(one per worker above, same names).\n"
         f"agents MUST contain EXACTLY {worker_count} entries.\n"
+        f"debate_room MUST contain EXACTLY {worker_count} entries — one card per worker "
+        f"(map each worker's argument into role/conclusion/disagreement/mindChanged).\n"
+        "evidence_vault.clusters MUST include every Tavily URL from your system context.\n"
         "Synthesize verdict, pre_mortem, execution_roadmap, and tldr from workers "
         "and Tavily context only.\n"
+        "REQUIRED top-level keys: executive_summary, boardroom_summary, debate_room, "
+        "evidence_vault (not optional).\n"
         f"{build_ceo_json_spec(worker_count)}"
     )
 

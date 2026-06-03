@@ -10,6 +10,10 @@ from typing import Any
 import requests
 
 from services.debate_constants import AI_MODEL_ERROR_VERDICT
+from services.debate_result_codec import (
+    DebateResult,
+    build_debate_webhook_payload,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +85,43 @@ def _json_safe(value: Any) -> Any:
     return str(value)
 
 
+def notify_debate_completion_from_result(
+    debate_id: str,
+    result: DebateResult,
+    *,
+    runtime: int,
+    cost: float,
+    agent_count: int,
+    workers: list[Any] | None = None,
+) -> bool:
+    """
+    POST strict 7-zone debate completion JSON to shoal-web /api/webhooks/engine.
+    """
+    url = _resolve_webhook_url()
+    if not url:
+        logger.error("Webhook URL not configured; cannot deliver debate %s", debate_id)
+        return False
+
+    body = build_debate_webhook_payload(
+        debate_id,
+        result,
+        runtime=runtime,
+        cost=cost,
+        agent_count=agent_count,
+        workers=workers,
+    )
+
+    verdict = str(body.get("verdict") or "").strip()
+    if not verdict:
+        print(
+            f"[webhook] empty verdict for debate {debate_id} -> "
+            f"{AI_MODEL_ERROR_VERDICT!r}",
+        )
+        body["verdict"] = AI_MODEL_ERROR_VERDICT
+
+    return _post_webhook(url, _json_safe(body), debate_id, "debate-complete")
+
+
 def notify_debate_completion(
     debate_id: str,
     *,
@@ -92,8 +133,8 @@ def notify_debate_completion(
     pre_mortem: dict[str, list[str]] | None = None,
     execution_roadmap: dict[str, str] | None = None,
     evidence: list[dict[str, str]] | None = None,
-    executive_summary: dict[str, str] | None = None,
-    boardroom_summary: dict[str, str] | None = None,
+    executive_summary: dict[str, Any] | None = None,
+    boardroom_summary: dict[str, Any] | None = None,
     debate_room: list[dict[str, str]] | None = None,
     evidence_vault: dict[str, Any] | None = None,
     runtime: int,
@@ -101,61 +142,29 @@ def notify_debate_completion(
     agent_count: int,
 ) -> bool:
     """
-    POST canonical debate completion JSON to shoal-web /api/webhooks/engine.
+    Legacy kwargs wrapper — builds DebateResult and delegates to strict payload builder.
     """
-    url = _resolve_webhook_url()
-    if not url:
-        logger.error("Webhook URL not configured; cannot deliver debate %s", debate_id)
-        return False
-
-    safe_verdict = (verdict or "").strip()
-    if not safe_verdict:
-        print(
-            f"[webhook] empty verdict for debate {debate_id} -> "
-            f"{AI_MODEL_ERROR_VERDICT!r}",
-        )
-        safe_verdict = AI_MODEL_ERROR_VERDICT
-    safe_confidence = int(max(0, min(100, confidence)))
-    safe_agents = [
-        {
-            "name": str(agent.get("name") or f"Agent {index + 1}"),
-            "position": str(agent.get("position") or "No position recorded."),
-        }
-        for index, agent in enumerate(agents)
-        if isinstance(agent, dict)
-    ]
-
-    body: dict[str, Any] = {
-        "debate_id": debate_id,
-        "status": "completed",
-        "verdict": safe_verdict,
-        "confidence": safe_confidence,
-        "agents": safe_agents,
-        "runtime": int(max(1, runtime)),
-        "cost": float(cost),
-        "agentCount": int(agent_count),
+    result: DebateResult = {
+        "verdict": verdict,
+        "confidence": confidence,
+        "agents": agents,
+        "tldr": list(tldr or []),
+        "friction_matrix": list(friction_matrix or []),
+        "pre_mortem": pre_mortem or {"failure_modes": [], "critical_unknowns": []},
+        "execution_roadmap": execution_roadmap or {"immediate_action": "", "plan_b": ""},
+        "evidence": list(evidence or []),
+        "executive_summary": executive_summary if isinstance(executive_summary, dict) else {},
+        "boardroom_summary": boardroom_summary if isinstance(boardroom_summary, dict) else {},
+        "debate_room": list(debate_room or []),
+        "evidence_vault": evidence_vault if isinstance(evidence_vault, dict) else {},
     }
-
-    if tldr:
-        body["tldr"] = [str(item).strip() for item in tldr if str(item).strip()]
-    if friction_matrix:
-        body["friction_matrix"] = friction_matrix
-    if pre_mortem:
-        body["pre_mortem"] = pre_mortem
-    if execution_roadmap:
-        body["execution_roadmap"] = execution_roadmap
-    if evidence:
-        body["evidence"] = evidence
-    if executive_summary:
-        body["executive_summary"] = executive_summary
-    if boardroom_summary:
-        body["boardroom_summary"] = boardroom_summary
-    if debate_room:
-        body["debate_room"] = debate_room
-    if evidence_vault:
-        body["evidence_vault"] = evidence_vault
-
-    return _post_webhook(url, _json_safe(body), debate_id, "debate-complete")
+    return notify_debate_completion_from_result(
+        debate_id,
+        result,
+        runtime=runtime,
+        cost=cost,
+        agent_count=agent_count,
+    )
 
 
 def format_success_webhook_body(

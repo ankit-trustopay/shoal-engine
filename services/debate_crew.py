@@ -15,6 +15,7 @@ import logging
 from services.debate_result_codec import (
     DebateAgent,
     DebateResult,
+    build_debate_webhook_payload,
     evidence_for_webhook,
     fallback_debate_result,
     finalize_debate_result,
@@ -28,6 +29,7 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "DebateAgent",
     "DebateResult",
+    "build_debate_webhook_payload",
     "ensure_verdict",
     "fallback_debate_result",
     "finalize_debate_result",
