@@ -87,6 +87,10 @@ def notify_debate_completion(
     verdict: str,
     confidence: int,
     agents: list[dict[str, str]],
+    tldr: list[str] | None = None,
+    friction_matrix: list[dict[str, str]] | None = None,
+    pre_mortem: dict[str, list[str]] | None = None,
+    execution_roadmap: dict[str, str] | None = None,
     runtime: int,
     cost: float,
     agent_count: int,
@@ -126,6 +130,16 @@ def notify_debate_completion(
         "cost": float(cost),
         "agentCount": int(agent_count),
     }
+
+    if tldr:
+        body["tldr"] = [str(item).strip() for item in tldr if str(item).strip()]
+    if friction_matrix:
+        body["friction_matrix"] = friction_matrix
+    if pre_mortem:
+        body["pre_mortem"] = pre_mortem
+    if execution_roadmap:
+        body["execution_roadmap"] = execution_roadmap
+
     return _post_webhook(url, _json_safe(body), debate_id, "debate-complete")
 
 
