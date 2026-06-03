@@ -1,14 +1,10 @@
-"""CrewAI-compatible LLM instances routed through OpenRouter (ChatOpenAI)."""
+"""CrewAI-compatible LLM — always uses the shared OpenRouter DeepSeek client."""
 
 from __future__ import annotations
 
 from langchain_openai import ChatOpenAI
 
-from services.openrouter_llm import get_llm
-
-
-def _model_mix_from_tier(model_tier: str | None) -> int:
-    return 100 if (model_tier or "").strip().lower() == "plus" else 0
+from services.openrouter_llm import get_default_llm
 
 
 def build_crew_llm(
@@ -19,19 +15,10 @@ def build_crew_llm(
     temperature: float = 0.25,
     max_tokens: int = 4096,
 ) -> ChatOpenAI:
-    """
-    Build a LangChain ChatOpenAI client for CrewAI agents.
+    """Returns shared default_llm; tier/mix/requested_model are ignored."""
+    _ = (requested_model, model_tier, model_mix)
 
-    requested_model is accepted for API compatibility; tier/mix select Gemma vs DeepSeek.
-    """
-    _ = requested_model
-
-    if model_mix is not None:
-        mix = int(model_mix)
-    else:
-        mix = _model_mix_from_tier(model_tier)
-
-    llm = get_llm(mix)
+    llm = get_default_llm()
     llm.temperature = temperature
     llm.max_tokens = max_tokens
     return llm

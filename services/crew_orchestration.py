@@ -362,11 +362,6 @@ def _extract_sequential_task_outputs(crew_result: object, expected_count: int) -
     return outputs
 
 
-def _resolve_model_tier_from_mix(model_mix: float) -> str:
-    """0% mix = all Lite; any Plus share routes to the Plus OpenRouter model."""
-    return "plus" if model_mix > 0 else "lite"
-
-
 def orchestrate_debate(
     query: str,
     *,
@@ -377,10 +372,10 @@ def orchestrate_debate(
     Production debate entrypoint (delegates to services.debate_crew).
     agent_count is billing metadata only; execution uses 3 agents.
     """
-    _ = agent_count
+    _ = (agent_count, model_mix)
     from services.debate_crew import run_debate_crew
 
-    result = run_debate_crew(query, model_mix=model_mix)
+    result = run_debate_crew(query)
     return {
         "verdict": result["verdict"],
         "confidence": int(result["confidence"]),

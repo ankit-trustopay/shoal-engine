@@ -122,13 +122,12 @@ def debate(
     """
     print(
         f"[main] /debate accepted id={payload.debate_id} "
-        f"agents={payload.agent_count} mix={payload.model_mix}",
+        f"agents={payload.agent_count} model=deepseek/deepseek-chat",
     )
     logger.info(
-        "Debate accepted: debate_id=%s agents=%s model_mix=%s",
+        "Debate accepted: debate_id=%s agents=%s",
         payload.debate_id,
         payload.agent_count,
-        payload.model_mix,
     )
 
     background_tasks.add_task(

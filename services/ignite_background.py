@@ -211,11 +211,11 @@ def run_simple_debate_and_webhook(
     model_mix: float = 0,
 ) -> None:
     """Run debate crew and POST canonical JSON to shoal-web."""
-    print(f"[ignite_background] debate start id={debate_id} model_mix={model_mix}")
+    print(f"[ignite_background] debate start id={debate_id} model=deepseek/deepseek-chat")
     started = time.perf_counter()
 
     try:
-        result = finalize_debate_result(run_debate_crew(query, model_mix=model_mix))
+        result = finalize_debate_result(run_debate_crew(query))
     except Exception as exc:
         logger.exception("Debate crew unexpected failure for %s", debate_id)
         print(f"[ignite_background] debate exception: {exc}")

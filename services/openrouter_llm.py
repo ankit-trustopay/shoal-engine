@@ -1,7 +1,5 @@
 """
-Raw OpenRouter access via langchain_openai.ChatOpenAI (no CrewAI LLM wrapper).
-
-Logs exact HTTP failures (401, 402, 404, etc.) to stdout for Railway.
+Single OpenRouter model for all engine LLM calls (DeepSeek V3 via deepseek/deepseek-chat).
 """
 
 from __future__ import annotations
@@ -15,13 +13,15 @@ from langchain_openai import ChatOpenAI
 
 OPENROUTER_API_BASE = "https://openrouter.ai/api/v1"
 OPENROUTER_CHAT_URL = f"{OPENROUTER_API_BASE}/chat/completions"
-LITE_MODEL = "google/gemma-4-31b-it"
-PLUS_MODEL = "deepseek/deepseek-v4-flash"
+OPENROUTER_MODEL = "deepseek/deepseek-chat"
 
 OPENROUTER_HEADERS = {
     "HTTP-Referer": "https://shoalai.com",
     "X-Title": "Shoal AI",
 }
+
+_default_llm: ChatOpenAI | None = None
+_probe_done = False
 
 
 def _mask_key(api_key: str) -> str:
@@ -32,21 +32,16 @@ def _mask_key(api_key: str) -> str:
 
 
 def load_openrouter_api_key() -> str:
-    """Read OPENROUTER_API_KEY from environment (also checks .env via main load_dotenv)."""
     for env_name in ("OPENROUTER_API_KEY", "OPENROUTER_KEY"):
         raw = os.environ.get(env_name, "")
         if raw and str(raw).strip():
             key = str(raw).strip()
             print(
-                f"[openrouter_llm] loaded {env_name}={_mask_key(key)} "
-                f"len={len(key)}",
+                f"[openrouter_llm] loaded {env_name}={_mask_key(key)} len={len(key)}",
             )
             return key
 
-    print(
-        "[openrouter_llm] FATAL: OPENROUTER_API_KEY missing from os.environ. "
-        f"keys_sample={[k for k in os.environ if 'OPEN' in k.upper()][:8]}",
-    )
+    print("[openrouter_llm] FATAL: OPENROUTER_API_KEY missing from os.environ")
     raise RuntimeError("OPENROUTER_API_KEY is not configured")
 
 
@@ -64,9 +59,6 @@ def _classify_http_error(status_code: int, body: str) -> str:
 
 
 def probe_openrouter(model_name: str, api_key: str) -> None:
-    """
-  Direct HTTP probe (bypasses LangChain) to surface the exact OpenRouter error.
-    """
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
@@ -100,32 +92,34 @@ def probe_openrouter(model_name: str, api_key: str) -> None:
         raise RuntimeError(_classify_http_error(response.status_code, response.text))
 
 
-def resolve_model_name(model_mix: float | int) -> str:
-    return PLUS_MODEL if int(model_mix) > 50 else LITE_MODEL
+def get_default_llm() -> ChatOpenAI:
+    """Return the shared ChatOpenAI client (DeepSeek V3 on OpenRouter)."""
+    global _default_llm, _probe_done
 
+    if _default_llm is not None:
+        return _default_llm
 
-def get_llm(model_mix: float | int) -> ChatOpenAI:
-    """
-    Build ChatOpenAI pointed at OpenRouter. Probes API before returning.
-    """
-    mix = int(model_mix)
-    model_name = resolve_model_name(mix)
     api_key = load_openrouter_api_key()
 
-    probe_openrouter(model_name, api_key)
+    if not _probe_done:
+        probe_openrouter(OPENROUTER_MODEL, api_key)
+        _probe_done = True
 
     print(
-        f"[openrouter_llm] ChatOpenAI model={model_name} base={OPENROUTER_API_BASE}",
+        f"[openrouter_llm] ChatOpenAI model={OPENROUTER_MODEL} "
+        f"base={OPENROUTER_API_BASE}",
     )
 
-    return ChatOpenAI(
+    _default_llm = ChatOpenAI(
         openai_api_key=api_key,
         openai_api_base=OPENROUTER_API_BASE,
-        model_name=model_name,
+        model_name=OPENROUTER_MODEL,
         default_headers=OPENROUTER_HEADERS,
         temperature=0.35,
         max_tokens=2048,
     )
+
+    return _default_llm
 
 
 def log_langchain_error(exc: Exception, *, stage: str) -> None:
@@ -147,7 +141,6 @@ def log_langchain_error(exc: Exception, *, stage: str) -> None:
 
 
 def invoke_llm(llm: ChatOpenAI, system: str, user: str, *, stage: str) -> str:
-    """Single chat completion; logs and re-raises with classified message."""
     try:
         result = llm.invoke(
             [

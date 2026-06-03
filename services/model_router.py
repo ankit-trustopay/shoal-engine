@@ -6,27 +6,24 @@ import logging
 import os
 import re
 
-from services.openrouter_llm import LITE_MODEL, PLUS_MODEL
+from services.openrouter_llm import OPENROUTER_MODEL
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_OPENROUTER_MODEL = os.getenv("OPENROUTER_DEFAULT_MODEL", LITE_MODEL)
+DEFAULT_OPENROUTER_MODEL = os.getenv("OPENROUTER_DEFAULT_MODEL", OPENROUTER_MODEL)
 
-FALLBACK_OPENROUTER_MODEL = os.getenv("OPENROUTER_FALLBACK_MODEL", PLUS_MODEL)
+FALLBACK_OPENROUTER_MODEL = os.getenv("OPENROUTER_FALLBACK_MODEL", OPENROUTER_MODEL)
 
 OPENROUTER_MODEL_MAP: dict[str, str] = {
-    "lite": LITE_MODEL,
-    "gemma": LITE_MODEL,
-    "google/gemma-4-31b-it": LITE_MODEL,
-    "plus": PLUS_MODEL,
-    "deepseek": PLUS_MODEL,
-    "deepseek-v4-flash": PLUS_MODEL,
-    "deepseek/deepseek-v4-flash": PLUS_MODEL,
+    "lite": OPENROUTER_MODEL,
+    "plus": OPENROUTER_MODEL,
+    "deepseek": OPENROUTER_MODEL,
+    "deepseek-chat": OPENROUTER_MODEL,
+    "deepseek/deepseek-chat": OPENROUTER_MODEL,
+    "deepseek-v3": OPENROUTER_MODEL,
+    "deepseek/deepseek-v3": OPENROUTER_MODEL,
     "claude-3.5-sonnet": "anthropic/claude-3.5-sonnet",
     "anthropic/claude-3.5-sonnet": "anthropic/claude-3.5-sonnet",
-    "deepseek-v3": "deepseek/deepseek-chat",
-    "deepseek/deepseek-chat": "deepseek/deepseek-chat",
-    "deepseek/deepseek-v3": "deepseek/deepseek-v3",
 }
 
 
@@ -39,7 +36,6 @@ def _normalize_model_key(value: str) -> str:
 
 
 def resolve_openrouter_model(requested: str | None) -> str:
-    """Resolve a frontend model id/label to an OpenRouter model slug."""
     if not requested or not requested.strip():
         return DEFAULT_OPENROUTER_MODEL
 
@@ -64,7 +60,6 @@ def resolve_openrouter_model(requested: str | None) -> str:
 
 
 def get_fallback_openrouter_model(primary: str | None = None) -> str:
-    """Production fallback when the requested OpenRouter model is unavailable."""
     resolved_primary = resolve_openrouter_model(primary)
     if resolved_primary == FALLBACK_OPENROUTER_MODEL:
         return DEFAULT_OPENROUTER_MODEL

@@ -12,7 +12,7 @@ import re
 from typing import Any, TypedDict
 
 from services.debate_constants import AI_MODEL_ERROR_VERDICT
-from services.openrouter_llm import get_llm, invoke_llm, log_langchain_error
+from services.openrouter_llm import get_default_llm, invoke_llm, log_langchain_error
 
 logger = logging.getLogger(__name__)
 
@@ -211,19 +211,20 @@ def _build_result(
 def run_debate_crew(query: str, *, model_mix: float = 0) -> DebateResult:
     """
     Run 3-stage debate via direct OpenRouter ChatOpenAI calls.
-    Never raises — returns fallback on any failure.
+    model_mix is accepted for API compatibility but ignored (single model only).
     """
-    print(f"[debate_crew] === START model_mix={model_mix} ===")
+    _ = model_mix
+    print("[debate_crew] === START model=deepseek/deepseek-chat ===")
 
     trimmed = (query or "").strip()
     if not trimmed:
         return fallback_debate_result("Missing query")
 
     try:
-        llm = get_llm(model_mix)
+        llm = get_default_llm()
     except Exception as exc:
         logger.exception("LLM setup failed")
-        print(f"[debate_crew] get_llm failed: {exc}")
+        print(f"[debate_crew] get_default_llm failed: {exc}")
         return fallback_debate_result(str(exc))
 
     system_base = (
