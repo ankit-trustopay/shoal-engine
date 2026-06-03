@@ -99,7 +99,7 @@ class DebateCompletionPayload(BaseModel):
     confidence: int = Field(..., ge=0, le=100)
     agents: list[DebateAgentPosition] = Field(default_factory=list)
     tldr: list[str] = Field(..., min_length=3, max_length=5)
-    friction_matrix: list[FrictionMatrixEntry] = Field(..., min_length=1, max_length=5)
+    friction_matrix: list[FrictionMatrixEntry] = Field(..., min_length=1, max_length=50)
     pre_mortem: PreMortem
     execution_roadmap: ExecutionRoadmap
     runtime: int = Field(default=1, ge=1)

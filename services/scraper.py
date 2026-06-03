@@ -188,9 +188,10 @@ def _map_tavily_results(
         if not isinstance(result, dict):
             continue
         title = str(result.get("title") or "Untitled").strip()
-        snippet = _truncate_snippet(str(result.get("content") or "").strip())
+        raw_content = str(result.get("content") or result.get("snippet") or "").strip()
+        snippet = _truncate_snippet(raw_content) if raw_content else title[:500]
         page_url = str(result.get("url") or "").strip()
-        if not title or not snippet or not page_url:
+        if not title or not page_url:
             continue
         evidence.append(
             {
@@ -433,6 +434,117 @@ def _collect_tavily_evidence_dynamic(premise: str) -> list[EvidenceItem]:
         return _enrich_evidence_with_deep_fetch(evidence[:MAX_EVIDENCE_ITEMS])
 
     return evidence
+
+
+def _dedupe_evidence(items: list[EvidenceItem]) -> list[EvidenceItem]:
+    seen: set[str] = set()
+    unique: list[EvidenceItem] = []
+    for item in items:
+        url_key = (item.get("url") or "").strip().lower()
+        if not url_key or url_key in seen:
+            continue
+        seen.add(url_key)
+        unique.append(item)
+    return unique
+
+
+def format_raw_tavily_research(items: list[EvidenceItem]) -> str:
+    """
+    Full raw Tavily bundle for LLM system prompts (URLs + complete excerpts).
+    """
+    if not items:
+        return (
+            "MANDATORY WEB RESEARCH: Tavily returned ZERO sources for this query.\n"
+            "You MUST NOT invent products, specs, or future releases. "
+            "State clearly that live data was inconclusive."
+        )
+
+    blocks: list[str] = [
+        f"MANDATORY WEB RESEARCH: {len(items)} Tavily source(s). "
+        "Use ONLY these excerpts and URLs — do not add facts from memory.",
+        "",
+    ]
+    for index, item in enumerate(items, start=1):
+        title = (item.get("title") or "Untitled").strip()
+        source = (item.get("source") or "Web (Tavily)").strip()
+        url = (item.get("url") or "").strip()
+        snippet = (item.get("snippet") or "").strip()
+        if len(snippet) > MAX_EVIDENCE_SNIPPET_CHARS:
+            snippet = snippet[:MAX_EVIDENCE_SNIPPET_CHARS] + "…"
+        blocks.append(
+            f"--- Source {index} ---\n"
+            f"Title: {title}\n"
+            f"Publisher/Source: {source}\n"
+            f"URL: {url}\n"
+            f"Raw excerpt:\n{snippet or '(no excerpt)'}\n",
+        )
+    return "\n".join(blocks)
+
+
+def mandatory_tavily_deep_research(query: str) -> tuple[str, list[EvidenceItem]]:
+    """
+    Mandatory pre-debate Tavily research. Always attempts live search before workers run.
+    Returns (raw_text_for_system_prompts, structured_evidence_items).
+    """
+    trimmed = query.strip()
+    if not trimmed:
+        logger.warning("mandatory_tavily_deep_research called with empty query")
+        return format_raw_tavily_research([]), []
+
+    api_key = _get_tavily_api_key()
+    if not api_key:
+        logger.error(
+            "TAVILY_API_KEY is not set — mandatory deep research cannot run",
+        )
+        return (
+            "MANDATORY WEB RESEARCH FAILED: TAVILY_API_KEY is not configured on the "
+            "engine. Do not invent facts; state that live web data is unavailable.",
+            [],
+        )
+
+    logger.info("Mandatory Tavily deep research start: %s", trimmed[:120])
+    evidence: list[EvidenceItem] = []
+
+    primary = _fetch_tavily_evidence(
+        trimmed,
+        max_results=MAX_EVIDENCE_ITEMS,
+        deep_fetch=True,
+    )
+    evidence.extend(primary)
+
+    if len(evidence) < MIN_EVIDENCE_ITEMS:
+        dynamic = _collect_tavily_evidence_dynamic(trimmed)
+        evidence = _dedupe_evidence([*evidence, *dynamic])
+
+    if len(evidence) < MIN_EVIDENCE_ITEMS:
+        supplement = _fetch_tavily_evidence(
+            trimmed,
+            max_results=MAX_EVIDENCE_ITEMS,
+            deep_fetch=False,
+        )
+        evidence = _dedupe_evidence([*evidence, *supplement])
+
+    evidence = _dedupe_evidence(evidence)[:MAX_EVIDENCE_ITEMS]
+
+    source_lower = lambda item: (item.get("source") or "").lower()
+    tavily_only = [
+        item
+        for item in evidence
+        if (item.get("url") or "").strip().lower().startswith("http")
+        and ("tavily" in source_lower(item) or "web (tavily" in source_lower(item))
+    ]
+    if not tavily_only:
+        tavily_only = [
+            item
+            for item in evidence
+            if (item.get("url") or "").strip().lower().startswith("http")
+        ]
+
+    logger.info(
+        "Mandatory Tavily deep research done: %s sources",
+        len(tavily_only),
+    )
+    return format_raw_tavily_research(tavily_only), tavily_only
 
 
 def scrape_for_premise(query: str) -> tuple[str, list[EvidenceItem]]:

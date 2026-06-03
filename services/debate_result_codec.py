@@ -16,7 +16,17 @@ from services.scraper import EvidenceItem
 
 AGENT_NAMES = ("Market Researcher", "Skeptical Debater", "CEO Synthesizer")
 
-CEO_JSON_SPEC = """
+ANTI_HALLUCINATION_RULE = (
+    "You are a data-driven analyst. You MUST base your arguments ONLY on the "
+    "provided web search context. Do not invent products, features, or future "
+    "models (e.g., do not guess 'Series 11' unless it is explicitly in the search "
+    "results). If the data is inconclusive, state that explicitly."
+)
+
+
+def build_ceo_json_spec(worker_count: int) -> str:
+    count = max(1, int(worker_count))
+    return f"""
 Return ONLY valid JSON (no markdown fences, no commentary) matching this exact schema:
 
 {
@@ -48,7 +58,8 @@ Return ONLY valid JSON (no markdown fences, no commentary) matching this exact s
 }
 
 Rules:
-- friction_matrix: one entry per worker argument supplied (use their name and distill their stance).
+- friction_matrix: EXACTLY {count} entries — one per worker listed below (same names, no merging).
+- agents: EXACTLY {count} entries — one per worker (name + one-sentence position).
 - stance must be exactly AGREES, DISAGREES, or NEUTRAL (uppercase).
 - pre_mortem.failure_modes: 3-5 scenarios grounded in the worker debate and query domain.
 - pre_mortem.critical_unknowns: 3-5 gaps where live web evidence was insufficient.
@@ -62,7 +73,13 @@ CONTEXT — execution_roadmap (CRITICAL):
 - Academic/scientific → papers, datasets, replication — not GTM sprints.
 - DO NOT use generic SaaS jargon ("48-hour sprints", "ICP", "CAC", "Series A")
   unless the query is explicitly about a B2B startup launch.
+
+{ANTI_HALLUCINATION_RULE}
 """
+
+
+# Backward-compatible default (3 workers)
+CEO_JSON_SPEC = build_ceo_json_spec(3)
 
 
 class DebateAgent(TypedDict):
@@ -220,13 +237,16 @@ def format_evidence_for_prompt(items: list[EvidenceItem]) -> str:
 
 
 def evidence_for_webhook(items: list[EvidenceItem]) -> list[dict[str, str]]:
+    """Map Tavily (or live web) hits to webhook evidence — excludes Shoal placeholders."""
     rows: list[dict[str, str]] = []
     for item in items:
         url = (item.get("url") or "").strip()
-        if not url.startswith("http"):
+        if not url.lower().startswith("http"):
+            continue
+        if "shoal.ai" in url.lower():
             continue
         title = (item.get("title") or "").strip() or url
-        source = (item.get("source") or "").strip() or "Web"
+        source = (item.get("source") or "").strip() or "Web (Tavily)"
         snippet = (item.get("snippet") or "").strip() or title[:500]
         rows.append(
             {
@@ -237,6 +257,40 @@ def evidence_for_webhook(items: list[EvidenceItem]) -> list[dict[str, str]]:
             },
         )
     return rows
+
+
+def friction_matrix_from_workers(
+    workers: list[Any],
+) -> list[dict[str, str]]:
+    """One friction row per spawned worker (source of truth for agent_count)."""
+    matrix: list[dict[str, str]] = []
+    for worker in workers:
+        name = str(getattr(worker, "name", "") or "").strip()
+        stance = str(getattr(worker, "stance_label", "") or "NEUTRAL").strip().upper()
+        if stance not in ("AGREES", "DISAGREES", "NEUTRAL"):
+            stance = "NEUTRAL"
+        argument = str(getattr(worker, "argument", "") or "").strip()
+        if not name or not argument:
+            continue
+        matrix.append(
+            {
+                "name": name,
+                "stance": stance,
+                "argument": argument[:500],
+            },
+        )
+    return matrix
+
+
+def agents_from_workers(workers: list[Any]) -> list[DebateAgent]:
+    return [
+        {
+            "name": str(getattr(w, "name", "")).strip(),
+            "position": str(getattr(w, "argument", "")).strip()[:500],
+        }
+        for w in workers
+        if str(getattr(w, "name", "")).strip()
+    ]
 
 
 def _extract_json_object(text: str) -> dict[str, Any] | None:
