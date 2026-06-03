@@ -159,3 +159,37 @@ def invoke_llm(llm: ChatOpenAI, system: str, user: str, *, stage: str) -> str:
     text = str(content or "").strip()
     print(f"[openrouter_llm] invoke stage={stage} chars={len(text)}")
     return text
+
+
+def invoke_llm_json(llm: ChatOpenAI, system: str, user: str, *, stage: str) -> str:
+    """
+    CEO synthesis: request JSON object mode when the provider supports it.
+    Falls back to plain invoke if json mode is rejected.
+    """
+    messages = [
+        SystemMessage(
+            content=(
+                f"{system.strip()}\n\n"
+                "You MUST respond with a single valid JSON object only. "
+                "No markdown, no code fences, no text outside the JSON."
+            ),
+        ),
+        HumanMessage(content=user),
+    ]
+
+    try:
+        json_llm = llm.bind(
+            response_format={"type": "json_object"},
+            temperature=0.2,
+        )
+        result = json_llm.invoke(messages)
+        text = str(getattr(result, "content", result) or "").strip()
+        print(f"[openrouter_llm] invoke_llm_json stage={stage} chars={len(text)}")
+        return text
+    except Exception as exc:
+        print(
+            f"[openrouter_llm] json_object mode failed stage={stage} "
+            f"type={type(exc).__name__}; falling back to plain invoke",
+        )
+        log_langchain_error(exc, stage=f"{stage}_json_mode")
+        return invoke_llm(llm, system, user, stage=stage)

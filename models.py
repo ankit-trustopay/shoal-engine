@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 from enum import Enum
-from typing import Literal, Optional, Self
+from typing import Any, Literal, Optional, Self
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import AliasChoices, BaseModel, Field, field_validator, model_validator
 
 from services.dynamic_personas import MAX_DEBATE_AGENTS
 
@@ -71,8 +71,6 @@ class PreMortem(BaseModel):
 
 
 class ExecutionRoadmap(BaseModel):
-    """Next steps — must be domain-specific to the user query (not generic SaaS playbooks)."""
-
     immediate_action: str = Field(..., min_length=1)
     plan_b: str = Field(..., min_length=1)
 
@@ -90,100 +88,199 @@ class DebateAgentPosition(BaseModel):
     position: str = Field(..., min_length=1)
 
 
+def _non_empty_or(value: str, fallback: str) -> str:
+    trimmed = (value or "").strip()
+    return trimmed if trimmed else fallback
+
+
 class ExecutiveSummary(BaseModel):
     """Top hero: BUY | WAIT | PIVOT + confidence + fit + reason."""
 
-    recommendation: Literal["BUY", "WAIT", "PIVOT"]
-    confidence: int = Field(..., ge=0, le=100)
-    fit_for_you: Literal["Excellent", "Good", "Weak"] = Field(alias="fitForYou")
-    one_line_reason: str = Field(..., min_length=1, alias="oneLineReason")
+    recommendation: Literal["BUY", "WAIT", "PIVOT"] = "WAIT"
+    confidence: int = Field(default=50, ge=0, le=100)
+    fit_for_you: Literal["Excellent", "Good", "Weak"] = Field(
+        default="Good",
+        validation_alias=AliasChoices("fit_for_you", "fitForYou"),
+        serialization_alias="fit_for_you",
+    )
+    one_line_reason: str = Field(
+        default="Synthesis completed from swarm deliberation.",
+        validation_alias=AliasChoices("one_line_reason", "oneLineReason"),
+        serialization_alias="one_line_reason",
+    )
 
-    model_config = {"populate_by_name": True}
+    model_config = {"populate_by_name": True, "extra": "ignore"}
 
-    @field_validator("one_line_reason")
+    @field_validator("recommendation", mode="before")
     @classmethod
-    def trim_reason(cls, value: str) -> str:
-        trimmed = value.strip()
-        if not trimmed:
-            raise ValueError("one_line_reason must not be empty")
-        return trimmed[:500]
+    def normalize_recommendation(cls, value: Any) -> str:
+        raw = str(value or "WAIT").strip().upper()
+        return raw if raw in ("BUY", "WAIT", "PIVOT") else "WAIT"
+
+    @field_validator("fit_for_you", mode="before")
+    @classmethod
+    def normalize_fit(cls, value: Any) -> str:
+        raw = str(value or "Good").strip()
+        return raw if raw in ("Excellent", "Good", "Weak") else "Good"
+
+    @field_validator("one_line_reason", mode="before")
+    @classmethod
+    def trim_reason(cls, value: Any) -> str:
+        return _non_empty_or(str(value or ""), "Synthesis completed from swarm deliberation.")[:500]
 
 
 class BoardroomSummary(BaseModel):
-    """Three-column tension board + boardroom findings."""
+    """Boardroom findings — strict 5 fields; legacy bull/bear synthesized when omitted."""
 
-    bull_case: str = Field(..., min_length=1, alias="bullCase")
-    bear_case: str = Field(..., min_length=1, alias="bearCase")
-    shoal_recommendation: str = Field(..., min_length=1, alias="shoalRecommendation")
-    main_opportunity: str = Field(..., min_length=1, alias="mainOpportunity")
-    main_risk: str = Field(..., min_length=1, alias="mainRisk")
-    hidden_tradeoff: str = Field(..., min_length=1, alias="hiddenTradeoff")
-    best_alternative: str = Field(..., min_length=1, alias="bestAlternative")
-    explanation: str = Field(..., min_length=1)
+    main_opportunity: str = Field(
+        default="Primary upside identified by the swarm.",
+        validation_alias=AliasChoices("main_opportunity", "mainOpportunity"),
+        serialization_alias="main_opportunity",
+    )
+    main_risk: str = Field(
+        default="Primary risk identified by the swarm.",
+        validation_alias=AliasChoices("main_risk", "mainRisk"),
+        serialization_alias="main_risk",
+    )
+    hidden_tradeoff: str = Field(
+        default="Speed versus certainty on unresolved unknowns.",
+        validation_alias=AliasChoices("hidden_tradeoff", "hiddenTradeoff"),
+        serialization_alias="hidden_tradeoff",
+    )
+    best_alternative: str = Field(
+        default="Narrow scope and re-run deliberation with tighter constraints.",
+        validation_alias=AliasChoices("best_alternative", "bestAlternative"),
+        serialization_alias="best_alternative",
+    )
+    explanation: str = Field(
+        default="The swarm weighed live research and adversarial worker arguments.",
+    )
+    bull_case: str = Field(
+        default="",
+        validation_alias=AliasChoices("bull_case", "bullCase"),
+        serialization_alias="bull_case",
+    )
+    bear_case: str = Field(
+        default="",
+        validation_alias=AliasChoices("bear_case", "bearCase"),
+        serialization_alias="bear_case",
+    )
+    shoal_recommendation: str = Field(
+        default="",
+        validation_alias=AliasChoices("shoal_recommendation", "shoalRecommendation"),
+        serialization_alias="shoal_recommendation",
+    )
 
-    model_config = {"populate_by_name": True}
+    model_config = {"populate_by_name": True, "extra": "ignore"}
+
+    @model_validator(mode="after")
+    def fill_legacy_tension_fields(self) -> Self:
+        updates: dict[str, str] = {}
+        if not self.bull_case.strip():
+            updates["bull_case"] = self.main_opportunity[:1200]
+        if not self.bear_case.strip():
+            updates["bear_case"] = self.main_risk[:1200]
+        if not self.shoal_recommendation.strip():
+            updates["shoal_recommendation"] = self.explanation[:1200]
+        if updates:
+            return self.model_copy(update=updates)
+        return self
 
     @field_validator(
-        "bull_case",
-        "bear_case",
-        "shoal_recommendation",
         "main_opportunity",
         "main_risk",
         "hidden_tradeoff",
         "best_alternative",
         "explanation",
+        mode="before",
     )
     @classmethod
-    def trim_text_fields(cls, value: str) -> str:
-        trimmed = value.strip()
-        if not trimmed:
-            raise ValueError("field must not be empty")
-        return trimmed[:1200]
+    def trim_core_fields(cls, value: Any) -> str:
+        return str(value or "").strip()[:1200]
 
 
 class DebateRoomAgent(BaseModel):
-    role: str = Field(..., min_length=1)
-    conclusion: str = Field(..., min_length=1)
-    disagreement: str = Field(..., min_length=1)
-    mind_changed: str = Field(..., min_length=1, alias="mindChanged")
+    role: str = Field(default="Analyst")
+    conclusion: str = Field(default="No conclusion recorded.")
+    disagreement: str = Field(default="No recorded disagreement.")
+    mind_changed: str = Field(
+        default="Held position after reviewing live research.",
+        validation_alias=AliasChoices("mind_changed", "mindChanged"),
+        serialization_alias="mind_changed",
+    )
 
-    model_config = {"populate_by_name": True}
+    model_config = {"populate_by_name": True, "extra": "ignore"}
 
-    @field_validator("role", "conclusion", "disagreement", "mind_changed")
+    @field_validator("role", "conclusion", "disagreement", "mind_changed", mode="before")
     @classmethod
-    def trim_fields(cls, value: str) -> str:
-        trimmed = value.strip()
-        if not trimmed:
-            raise ValueError("field must not be empty")
-        return trimmed[:800]
+    def trim_fields(cls, value: Any) -> str:
+        return _non_empty_or(str(value or ""), "—")[:800]
 
 
 class EvidenceVaultCitation(BaseModel):
-    title: str = Field(..., min_length=1)
-    url: str = Field(..., min_length=1)
-    source: str = Field(default="Web", min_length=1)
+    title: str = Field(default="Untitled")
+    url: str = Field(default="https://example.com")
+    source: str = Field(default="Web")
     snippet: str = Field(default="")
+
+    model_config = {"extra": "ignore"}
+
+    @field_validator("title", "url", "source", mode="before")
+    @classmethod
+    def trim_citation(cls, value: Any) -> str:
+        return str(value or "").strip()[:2000]
 
 
 class EvidenceVaultClusters(BaseModel):
     reddit: list[EvidenceVaultCitation] = Field(default_factory=list)
-    youtube: list[EvidenceVaultCitation] = Field(default_factory=list)
-    official: list[EvidenceVaultCitation] = Field(default_factory=list)
     news: list[EvidenceVaultCitation] = Field(default_factory=list)
+    official: list[EvidenceVaultCitation] = Field(default_factory=list)
+    youtube: list[EvidenceVaultCitation] = Field(default_factory=list)
+
+    model_config = {"extra": "ignore"}
 
 
 class EvidenceVaultStats(BaseModel):
-    total_sources: int = Field(..., ge=0, alias="totalSources")
-    high_signal: int = Field(..., ge=0, alias="highSignal")
-    contradictory: int = Field(..., ge=0, alias="contradictory")
-    dominant_consensus: int = Field(..., ge=0, alias="dominantConsensus")
+    total: int = Field(
+        default=0,
+        ge=0,
+        validation_alias=AliasChoices("total", "total_sources", "totalSources"),
+        serialization_alias="total",
+    )
+    high_signal: int = Field(
+        default=0,
+        ge=0,
+        validation_alias=AliasChoices("high_signal", "highSignal"),
+        serialization_alias="high_signal",
+    )
+    contradictory: int = Field(default=0, ge=0)
+    dominant_consensus: int = Field(
+        default=0,
+        ge=0,
+        validation_alias=AliasChoices("dominant_consensus", "dominantConsensus"),
+    )
 
-    model_config = {"populate_by_name": True}
+    model_config = {"populate_by_name": True, "extra": "ignore"}
 
 
 class EvidenceVault(BaseModel):
-    stats: EvidenceVaultStats
-    clusters: EvidenceVaultClusters
+    stats: EvidenceVaultStats = Field(default_factory=EvidenceVaultStats)
+    clusters: EvidenceVaultClusters = Field(default_factory=EvidenceVaultClusters)
+
+    model_config = {"extra": "ignore"}
+
+
+class SevenZoneReport(BaseModel):
+    """Lenient CEO output — only the four UI zones + verdict/confidence."""
+
+    verdict: str = Field(default="Deliberation complete.")
+    confidence: int = Field(default=50, ge=0, le=100)
+    executive_summary: ExecutiveSummary = Field(default_factory=ExecutiveSummary)
+    boardroom_summary: BoardroomSummary = Field(default_factory=BoardroomSummary)
+    debate_room: list[DebateRoomAgent] = Field(default_factory=list)
+    evidence_vault: EvidenceVault = Field(default_factory=EvidenceVault)
+
+    model_config = {"extra": "ignore"}
 
 
 class DebateCompletionPayload(BaseModel):

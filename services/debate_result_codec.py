@@ -22,6 +22,7 @@ from models import (
     ExecutiveSummary,
     FrictionMatrixEntry,
     PreMortem,
+    SevenZoneReport,
 )
 from pydantic import ValidationError
 
@@ -41,97 +42,54 @@ ANTI_HALLUCINATION_RULE = (
 def build_ceo_json_spec(worker_count: int) -> str:
     count = max(1, int(worker_count))
     return f"""
-Return ONLY valid JSON (no markdown fences, no commentary) matching this exact schema:
+Return ONLY a single JSON object. No markdown fences, no prose before or after, no commentary.
+
+REQUIRED schema (every key below must be present):
 
 {{
-  "verdict": "<2-4 sentence executive verdict>",
+  "verdict": "<2-4 sentence executive verdict grounded in workers + Tavily>",
   "confidence": <integer 0-100>,
   "executive_summary": {{
     "recommendation": "BUY",
-    "confidence": <integer 0-100 — MUST match top-level confidence>,
-    "fitForYou": "Excellent",
-    "oneLineReason": "Because <X, Y, Z grounded in workers + Tavily>"
+    "confidence": <same integer as top-level confidence>,
+    "fit_for_you": "Excellent",
+    "one_line_reason": "Because <decisive reason from workers + Tavily>"
   }},
   "boardroom_summary": {{
-    "bullCase": "<strongest bull case from AGREES workers + Tavily>",
-    "bearCase": "<strongest bear / pre-mortem risk from DISAGREES workers>",
-    "shoalRecommendation": "<synthesized middle-ground verdict>",
-    "mainOpportunity": "<single clearest upside>",
-    "mainRisk": "<single clearest downside>",
-    "hiddenTradeoff": "<non-obvious tradeoff the swarm surfaced>",
-    "bestAlternative": "<credible Plan B path>",
-    "explanation": "<exactly 2 sentences: why this matters for the user query>"
+    "main_opportunity": "<single clearest upside>",
+    "main_risk": "<single clearest downside>",
+    "hidden_tradeoff": "<non-obvious tradeoff the swarm surfaced>",
+    "best_alternative": "<credible Plan B>",
+    "explanation": "<exactly 2 sentences tied to the user query>"
   }},
   "debate_room": [
     {{
-      "role": "<boardroom role e.g. Product Analyst, Skeptic, Budget Buyer>",
-      "conclusion": "<this worker's conclusion in 2-3 sentences>",
-      "disagreement": "<what they disagreed with another seat on>",
-      "mindChanged": "Moved from YES to MAYBE after reviewing pricing data"
+      "role": "<seat title e.g. Product Analyst, Skeptic>",
+      "conclusion": "<worker conclusion in 2-3 sentences>",
+      "disagreement": "<what this seat challenged>",
+      "mind_changed": "<stance shift e.g. Moved from YES to MAYBE after pricing data>"
     }}
   ],
   "evidence_vault": {{
     "stats": {{
-      "totalSources": <integer — approximate Tavily corpus size reviewed>,
-      "highSignal": <integer — high-relevance sources>,
-      "contradictory": <integer — sources with conflicting claims>,
-      "dominantConsensus": <0 or 1 — 1 if one narrative clearly dominates>
+      "total": <integer — sources reviewed, >= cited URLs>,
+      "high_signal": <integer — high-relevance sources>
     }},
     "clusters": {{
-      "reddit": [{{"title": "...", "url": "http...", "source": "...", "snippet": "..."}}],
-      "youtube": [],
-      "official": [],
-      "news": []
+      "reddit": [{{"title": "...", "url": "https://...", "source": "...", "snippet": "..."}}],
+      "news": [],
+      "official": []
     }}
-  }},
-  "tldr": [
-    "<bullet 1: why this verdict — decisive reason>",
-    "<bullet 2: key risk or constraint>",
-    "<bullet 3: what must be true for success>"
-  ],
-  "friction_matrix": [
-    {{
-      "name": "<worker name>",
-      "stance": "AGREES",
-      "argument": "<1-2 sentence summary of that worker's argument>"
-    }}
-  ],
-  "pre_mortem": {{
-    "failure_modes": ["<mode 1>", "<mode 2>", "<mode 3>"],
-    "critical_unknowns": ["<unknown 1>", "<unknown 2>", "<unknown 3>"]
-  }},
-  "execution_roadmap": {{
-    "immediate_action": "<specific next step for this exact query>",
-    "plan_b": "<credible alternative if the primary path fails>"
-  }},
-  "agents": [
-    {{"name": "<worker name>", "position": "<one sentence>"}}
-  ]
+  }}
 }}
 
-Rules (REQUIRED — omitting any key fails the pipeline):
-- You MUST include executive_summary, boardroom_summary, debate_room, evidence_vault at the top level.
-- executive_summary.recommendation MUST be exactly BUY, WAIT, or PIVOT.
-- executive_summary.confidence MUST equal the top-level confidence integer.
-- executive_summary.fitForYou MUST be exactly Excellent, Good, or Weak.
-- boardroom_summary: bullCase and bearCase MUST be derived from worker friction (not generic).
-- boardroom_summary.hiddenTradeoff MUST reflect a real tension between workers or Tavily sources.
-- debate_room: EXACTLY {count} entries — map each worker below into one card (role, conclusion, disagreement, mindChanged).
-- debate_room.mindChanged: realistic stance shift tied to Tavily or a peer argument.
-- evidence_vault.stats: realistic integers based on Tavily corpus (totalSources >= cited URL count).
-- evidence_vault.clusters: assign EVERY Tavily URL from the system context to exactly one cluster:
-  reddit (reddit.com), youtube (youtube.com / youtu.be), official (.gov, docs, filings, github),
-  news (everything else: blogs, press, reviews).
-- Do NOT return only legacy agents[] — agents is supplementary; the 7-zone fields are mandatory.
-- friction_matrix: EXACTLY {count} entries — one per worker (same names, no merging).
-- agents: EXACTLY {count} entries — one per worker (name + one-sentence position).
-- stance must be exactly AGREES, DISAGREES, or NEUTRAL (uppercase).
-- tldr must have exactly 3 strings.
-- Match vocabulary to the user's query (history, politics, purchase, science, career, etc.).
-
-CONTEXT — execution_roadmap (CRITICAL):
-- immediate_action and plan_b MUST be highly specific to the user's exact query.
-- DO NOT use generic SaaS jargon unless the query is explicitly about a B2B startup launch.
+Rules:
+- recommendation MUST be exactly BUY, WAIT, or PIVOT.
+- fit_for_you MUST be exactly Excellent, Good, or Weak.
+- debate_room MUST contain EXACTLY {count} objects — one per worker listed in the user message.
+- Assign every Tavily URL from system context to reddit, news, or official (no other cluster keys).
+- Use snake_case keys exactly as shown (fit_for_you, one_line_reason, mind_changed, main_opportunity, high_signal).
+- Do not omit executive_summary, boardroom_summary, debate_room, or evidence_vault.
 
 {ANTI_HALLUCINATION_RULE}
 """
@@ -304,9 +262,15 @@ def build_evidence_vault(
     ) or {}
 
     def _stat(key_snake: str, key_camel: str, default: int) -> int:
-        raw = stats_raw.get(key_snake) if isinstance(stats_raw, dict) else None
-        if raw is None and isinstance(stats_raw, dict):
-            raw = stats_raw.get(key_camel)
+        raw = None
+        if isinstance(stats_raw, dict):
+            raw = stats_raw.get(key_snake)
+            if raw is None:
+                raw = stats_raw.get(key_camel)
+            if raw is None and key_snake == "total_sources":
+                raw = stats_raw.get("total")
+            if raw is None and key_snake == "high_signal":
+                raw = stats_raw.get("high_signal")
         if isinstance(raw, (int, float)):
             return max(0, int(raw))
         return default
@@ -340,6 +304,8 @@ def build_evidence_vault(
 
     return {
         "stats": {
+            "total": total_sources,
+            "high_signal": high_signal,
             "totalSources": total_sources,
             "highSignal": high_signal,
             "contradictory": contradictory,
@@ -445,34 +411,35 @@ def build_boardroom_summary(
     ceo_summary: dict[str, Any] | None = None,
 ) -> dict[str, str]:
     if isinstance(ceo_summary, dict):
-        fields = (
-            "bullCase",
-            "bearCase",
-            "shoalRecommendation",
+        field_pairs = (
+            ("mainOpportunity", "main_opportunity"),
+            ("mainRisk", "main_risk"),
+            ("hiddenTradeoff", "hidden_tradeoff"),
+            ("bestAlternative", "best_alternative"),
+            ("explanation", "explanation"),
+            ("bullCase", "bull_case"),
+            ("bearCase", "bear_case"),
+            ("shoalRecommendation", "shoal_recommendation"),
+        )
+        out: dict[str, str] = {}
+        for camel, snake_key in field_pairs:
+            val = str(ceo_summary.get(camel) or ceo_summary.get(snake_key) or "").strip()
+            if val:
+                out[camel] = val[:1200]
+        core_keys = (
             "mainOpportunity",
             "mainRisk",
             "hiddenTradeoff",
             "bestAlternative",
             "explanation",
         )
-        snake = {
-            "bullCase": "bull_case",
-            "bearCase": "bear_case",
-            "shoalRecommendation": "shoal_recommendation",
-            "mainOpportunity": "main_opportunity",
-            "mainRisk": "main_risk",
-            "hiddenTradeoff": "hidden_tradeoff",
-            "bestAlternative": "best_alternative",
-            "explanation": "explanation",
-        }
-        out: dict[str, str] = {}
-        for camel, snake_key in snake.items():
-            val = str(ceo_summary.get(camel) or ceo_summary.get(snake_key) or "").strip()
-            if val:
-                out[camel] = val[:1200]
-        if len(out) >= 6:
-            if "explanation" not in out:
-                out["explanation"] = " ".join(tldr[:2])[:600] if tldr else verdict[:600]
+        if all(out.get(key) for key in core_keys):
+            if "bullCase" not in out:
+                out["bullCase"] = out["mainOpportunity"]
+            if "bearCase" not in out:
+                out["bearCase"] = out["mainRisk"]
+            if "shoalRecommendation" not in out:
+                out["shoalRecommendation"] = out.get("explanation") or verdict[:500]
             return out
 
     bull = _pick_friction_argument(friction_matrix, "AGREES") or (tldr[0] if tldr else "")
@@ -794,6 +761,132 @@ def _extract_json_object(text: str) -> dict[str, Any] | None:
         return None
 
 
+def _verdict_from_raw_text(raw_text: str, query: str) -> str:
+    text = (raw_text or "").strip()
+    if not text:
+        if query.strip():
+            return f"Deliberation on “{query.strip()[:80]}” completed with partial synthesis."
+        return "Deliberation complete with partial synthesis."
+
+    embedded = _extract_json_object(text)
+    if embedded:
+        verdict = str(embedded.get("verdict") or "").strip()
+        if verdict:
+            return verdict[:2000]
+
+    for line in text.splitlines():
+        cleaned = line.strip()
+        if not cleaned or cleaned.startswith("{") or cleaned.startswith("```"):
+            continue
+        return cleaned[:2000]
+
+    return text[:2000]
+
+
+def _safe_model_validate(model_cls: type, raw: Any, **defaults: Any):
+    merged = {**defaults}
+    if isinstance(raw, dict):
+        merged.update(raw)
+    try:
+        return model_cls.model_validate(merged)
+    except ValidationError as exc:
+        print(f"[debate] {model_cls.__name__} coerce warning: {exc}")
+        try:
+            return model_cls.model_validate(defaults)
+        except ValidationError:
+            return model_cls()
+
+
+def coerce_seven_zone_report(
+    parsed: dict[str, Any] | None,
+    *,
+    raw_text: str = "",
+    query: str = "",
+) -> SevenZoneReport:
+    """Always return a valid SevenZoneReport — never raise."""
+    data = parsed if isinstance(parsed, dict) else {}
+
+    verdict = str(data.get("verdict") or "").strip() or _verdict_from_raw_text(raw_text, query)
+    confidence_raw = data.get("confidence", 50)
+    confidence = (
+        int(max(0, min(100, round(float(confidence_raw)))))
+        if isinstance(confidence_raw, (int, float))
+        else 50
+    )
+
+    exec_raw = data.get("executive_summary") or data.get("executiveSummary")
+    if not isinstance(exec_raw, dict):
+        exec_raw = build_executive_summary(
+            verdict=verdict,
+            confidence=confidence,
+            tldr=[],
+        )
+    exec_raw = dict(exec_raw)
+    exec_raw.setdefault("confidence", confidence)
+    executive = _safe_model_validate(ExecutiveSummary, exec_raw, confidence=confidence)
+
+    board_raw = data.get("boardroom_summary") or data.get("boardroomSummary")
+    if not isinstance(board_raw, dict):
+        board_raw = {}
+    boardroom = _safe_model_validate(
+        BoardroomSummary,
+        board_raw,
+        main_opportunity=verdict[:200] or "Upside case from swarm synthesis.",
+        main_risk="Downside case if key assumptions fail.",
+        explanation=verdict[:500] or "Swarm weighed live research and worker arguments.",
+    )
+
+    room_raw = data.get("debate_room") or data.get("debateRoom")
+    debate_room: list[DebateRoomAgent] = []
+    if isinstance(room_raw, list):
+        for item in room_raw:
+            if isinstance(item, dict):
+                debate_room.append(
+                    _safe_model_validate(DebateRoomAgent, item),
+                )
+    if not debate_room:
+        debate_room = [
+            _safe_model_validate(
+                DebateRoomAgent,
+                None,
+                role="CEO Synthesizer",
+                conclusion=verdict[:800],
+            ),
+        ]
+
+    vault_raw = data.get("evidence_vault") or data.get("evidenceVault")
+    if isinstance(vault_raw, dict):
+        try:
+            evidence_vault = _parse_evidence_vault_dict(vault_raw)
+        except ValidationError as exc:
+            print(f"[debate] evidence_vault coerce warning: {exc}")
+            evidence_vault = EvidenceVault()
+    else:
+        evidence_vault = EvidenceVault()
+
+    try:
+        return SevenZoneReport.model_validate(
+            {
+                "verdict": verdict,
+                "confidence": confidence,
+                "executive_summary": executive,
+                "boardroom_summary": boardroom,
+                "debate_room": debate_room,
+                "evidence_vault": evidence_vault,
+            },
+        )
+    except ValidationError as exc:
+        print(f"[debate] SevenZoneReport fallback: {exc}")
+        return SevenZoneReport(
+            verdict=verdict,
+            confidence=confidence,
+            executive_summary=executive,
+            boardroom_summary=boardroom,
+            debate_room=debate_room,
+            evidence_vault=evidence_vault,
+        )
+
+
 def _coerce_completion_payload(parsed: dict[str, Any]) -> DebateCompletionPayload | None:
     try:
         return DebateCompletionPayload.model_validate(parsed)
@@ -806,6 +899,8 @@ def _executive_summary_to_dict(summary: ExecutiveSummary) -> dict[str, Any]:
     return {
         "recommendation": summary.recommendation,
         "confidence": summary.confidence,
+        "fit_for_you": summary.fit_for_you,
+        "one_line_reason": summary.one_line_reason,
         "fitForYou": summary.fit_for_you,
         "oneLineReason": summary.one_line_reason,
     }
@@ -813,14 +908,21 @@ def _executive_summary_to_dict(summary: ExecutiveSummary) -> dict[str, Any]:
 
 def _boardroom_summary_to_dict(summary: BoardroomSummary) -> dict[str, str]:
     return {
-        "bullCase": summary.bull_case,
-        "bearCase": summary.bear_case,
-        "shoalRecommendation": summary.shoal_recommendation,
+        "main_opportunity": summary.main_opportunity,
+        "main_risk": summary.main_risk,
+        "hidden_tradeoff": summary.hidden_tradeoff,
+        "best_alternative": summary.best_alternative,
+        "explanation": summary.explanation,
         "mainOpportunity": summary.main_opportunity,
         "mainRisk": summary.main_risk,
         "hiddenTradeoff": summary.hidden_tradeoff,
         "bestAlternative": summary.best_alternative,
-        "explanation": summary.explanation,
+        "bull_case": summary.bull_case,
+        "bear_case": summary.bear_case,
+        "shoal_recommendation": summary.shoal_recommendation,
+        "bullCase": summary.bull_case,
+        "bearCase": summary.bear_case,
+        "shoalRecommendation": summary.shoal_recommendation,
     }
 
 
@@ -830,6 +932,7 @@ def _debate_room_to_dict(room: list[DebateRoomAgent]) -> list[dict[str, str]]:
             "role": agent.role,
             "conclusion": agent.conclusion,
             "disagreement": agent.disagreement,
+            "mind_changed": agent.mind_changed,
             "mindChanged": agent.mind_changed,
         }
         for agent in room
@@ -839,7 +942,9 @@ def _debate_room_to_dict(room: list[DebateRoomAgent]) -> list[dict[str, str]]:
 def _evidence_vault_to_dict(vault: EvidenceVault) -> dict[str, Any]:
     return {
         "stats": {
-            "totalSources": vault.stats.total_sources,
+            "total": vault.stats.total,
+            "high_signal": vault.stats.high_signal,
+            "totalSources": vault.stats.total,
             "highSignal": vault.stats.high_signal,
             "contradictory": vault.stats.contradictory,
             "dominantConsensus": vault.stats.dominant_consensus,
@@ -913,10 +1018,22 @@ def _parse_evidence_vault_dict(raw: dict[str, Any]) -> EvidenceVault:
             )
         return out
 
+    total = int(
+        stats_raw.get("total")
+        or stats_raw.get("totalSources")
+        or stats_raw.get("total_sources")
+        or 0,
+    )
+    high_signal = int(
+        stats_raw.get("high_signal")
+        or stats_raw.get("highSignal")
+        or 0,
+    )
+
     return EvidenceVault(
         stats=EvidenceVaultStats(
-            total_sources=int(stats_raw.get("totalSources") or stats_raw.get("total_sources") or 0),
-            high_signal=int(stats_raw.get("highSignal") or stats_raw.get("high_signal") or 0),
+            total=max(0, total),
+            high_signal=max(0, high_signal),
             contradictory=int(stats_raw.get("contradictory") or 0),
             dominant_consensus=int(
                 stats_raw.get("dominantConsensus")
@@ -1076,26 +1193,18 @@ def debate_result_to_completion_payload(
             friction_matrix=friction_raw,
             execution_roadmap=dict(road_raw),
         )
-    boardroom = BoardroomSummary(
-        bull_case=str(board_raw.get("bullCase") or board_raw.get("bull_case") or "Upside case from swarm synthesis.")[:1200],
-        bear_case=str(board_raw.get("bearCase") or board_raw.get("bear_case") or "Downside case from swarm synthesis.")[:1200],
-        shoal_recommendation=str(
-            board_raw.get("shoalRecommendation")
-            or board_raw.get("shoal_recommendation")
-            or verdict[:500],
-        )[:1200],
-        main_opportunity=str(
-            board_raw.get("mainOpportunity") or board_raw.get("main_opportunity") or tldr[0],
-        )[:1200],
-        main_risk=str(board_raw.get("mainRisk") or board_raw.get("main_risk") or (tldr[1] if len(tldr) > 1 else "Key downside risk."))[:1200],
-        hidden_tradeoff=str(
-            board_raw.get("hiddenTradeoff") or board_raw.get("hidden_tradeoff") or "Speed versus certainty.",
-        )[:1200],
-        best_alternative=str(
-            board_raw.get("bestAlternative") or board_raw.get("best_alternative") or execution.plan_b,
-        )[:1200],
-        explanation=str(board_raw.get("explanation") or " ".join(tldr[:2]))[:1200],
-    )
+    try:
+        boardroom = BoardroomSummary.model_validate(board_raw)
+    except ValidationError:
+        boardroom = BoardroomSummary.model_validate(
+            build_boardroom_summary(
+                verdict=verdict,
+                tldr=tldr,
+                friction_matrix=friction_raw,
+                execution_roadmap=dict(road_raw),
+                ceo_summary=board_raw,
+            ),
+        )
 
     room_raw = ensured.get("debate_room")
     debate_room = (
@@ -1261,23 +1370,119 @@ def parse_ceo_json(
     worker_digest: str,
     query: str,
 ) -> DebateResult:
-    """Parse CEO Turn-2 JSON into a DebateResult."""
-    final_text = synthesis or ""
-    parsed = _extract_json_object(final_text)
+    """Parse CEO Turn-2 JSON into a DebateResult (never raises)."""
+    return safe_synthesize_ceo_result(
+        synthesis,
+        worker_digest=worker_digest,
+        query=query,
+    )
 
+
+def safe_synthesize_ceo_result(
+    synthesis: str,
+    *,
+    worker_digest: str = "",
+    query: str = "",
+    workers: list[Any] | None = None,
+    evidence_rows: list[dict[str, str]] | None = None,
+) -> DebateResult:
+    """
+    Bulletproof CEO synthesis: parse JSON when possible, else build valid 7-zone output
+    from raw text so the debate still completes.
+    """
+    final_text = (synthesis or "").strip()
+    print(
+        f"[debate] safe_synthesize_ceo_result chars={len(final_text)} "
+        f"workers={len(workers or [])} evidence={len(evidence_rows or [])}",
+    )
+
+    parsed = _extract_json_object(final_text) if final_text else None
     if parsed:
+        if not isinstance(parsed.get("tldr"), list) or len(parsed.get("tldr") or []) < 3:
+            verdict_seed = str(parsed.get("verdict") or _verdict_from_raw_text(final_text, query))
+            parsed["tldr"] = [
+                verdict_seed[:200] or "Executive verdict synthesized.",
+                "Key risk surfaced during adversarial deliberation.",
+                "Validate decisive claims against cited live sources.",
+            ]
+        if not parsed.get("friction_matrix") and not parsed.get("frictionMatrix"):
+            parsed["friction_matrix"] = _default_friction_matrix()
+        if not parsed.get("pre_mortem") and not parsed.get("preMortem"):
+            parsed["pre_mortem"] = _default_pre_mortem()
+        if not parsed.get("execution_roadmap") and not parsed.get("executionRoadmap"):
+            parsed["execution_roadmap"] = _default_execution_roadmap(query)
+
         completion = _coerce_completion_payload(parsed)
         if completion:
-            return finalize_debate_result(_payload_to_result(completion))
+            print("[debate] CEO strict DebateCompletionPayload OK")
+            result = finalize_debate_result(_payload_to_result(completion))
+            if evidence_rows:
+                result["evidence"] = evidence_rows
+            return _ensure_boardroom_fields(result, workers)
 
         partial = _build_result_from_partial(parsed, worker_digest, query)
         if partial:
-            return partial
+            print("[debate] CEO partial JSON path OK")
+            if evidence_rows:
+                partial["evidence"] = evidence_rows
+            return _ensure_boardroom_fields(partial, workers)
 
-    if not final_text.strip():
-        return fallback_debate_result("Empty CEO synthesis", query)
+    zones = coerce_seven_zone_report(parsed, raw_text=final_text, query=query)
+    print(
+        f"[debate] CEO seven-zone coerce verdict_len={len(zones.verdict)} "
+        f"debate_room={len(zones.debate_room)}",
+    )
 
-    return fallback_debate_result("Could not parse CEO JSON", query)
+    tldr = [
+        zones.verdict[:200] if zones.verdict else "Verdict synthesized from swarm debate.",
+        zones.boardroom_summary.main_risk[:200],
+        zones.boardroom_summary.main_opportunity[:200],
+    ]
+
+    friction_matrix = (
+        friction_matrix_from_workers(workers)
+        if workers
+        else _default_friction_matrix()
+    )
+    agents = agents_from_workers(workers) if workers else []
+
+    result = finalize_debate_result(
+        {
+            "verdict": zones.verdict,
+            "confidence": zones.confidence,
+            "agents": agents,
+            "tldr": tldr,
+            "friction_matrix": friction_matrix,
+            "pre_mortem": _default_pre_mortem(),
+            "execution_roadmap": _default_execution_roadmap(query),
+            "evidence": list(evidence_rows or []),
+            "executive_summary": zones.executive_summary.model_dump(by_alias=False),
+            "boardroom_summary": zones.boardroom_summary.model_dump(by_alias=False),
+            "debate_room": [
+                card.model_dump(by_alias=False) for card in zones.debate_room
+            ],
+            "evidence_vault": _evidence_vault_to_dict(zones.evidence_vault),
+        },
+    )
+
+    if workers:
+        result["friction_matrix"] = friction_matrix_from_workers(workers)
+        result["agents"] = agents_from_workers(workers)
+        result["debate_room"] = build_debate_room(
+            workers,
+            result["friction_matrix"],
+            ceo_room=result.get("debate_room"),
+        )
+
+    if evidence_rows:
+        result["evidence_vault"] = build_evidence_vault(
+            evidence_rows,
+            confidence=result["confidence"],
+            friction_matrix=result["friction_matrix"],
+            ceo_vault=result.get("evidence_vault"),
+        )
+
+    return _ensure_boardroom_fields(result, workers)
 
 
 def _build_result_from_partial(

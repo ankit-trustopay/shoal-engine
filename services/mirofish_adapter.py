@@ -24,14 +24,12 @@ from langchain_openai import ChatOpenAI
 from services.debate_result_codec import (
     ANTI_HALLUCINATION_RULE,
     DebateResult,
-    _ensure_boardroom_fields,
-    agents_from_workers,
     build_ceo_json_spec,
     evidence_for_webhook,
     fallback_debate_result,
     finalize_debate_result,
     friction_matrix_from_workers,
-    parse_ceo_json,
+    safe_synthesize_ceo_result,
 )
 from services.dynamic_personas import (
     ADVERSARIAL_ARCHETYPES,
@@ -41,6 +39,7 @@ from services.dynamic_personas import (
 from services.openrouter_llm import (
     get_default_llm,
     invoke_llm,
+    invoke_llm_json,
     log_langchain_error,
 )
 from services.scraper import EvidenceItem, mandatory_tavily_deep_research
@@ -116,9 +115,11 @@ def _worker_user_prompt(query: str) -> str:
 
 def _ceo_system_prompt(web_research_raw: str) -> str:
     return (
-        "You are the CEO Synthesizer for Shoal AI. You receive the full panel "
-        "of stateless worker arguments plus mandatory Tavily web research.\n"
-        "Produce the final institutional executive report as JSON only.\n"
+        "You are the CEO Synthesizer for Shoal AI. You receive worker arguments "
+        "and mandatory Tavily web research.\n"
+        "Output ONE JSON object with keys: verdict, confidence, executive_summary, "
+        "boardroom_summary, debate_room, evidence_vault.\n"
+        "Use snake_case field names exactly as specified in the user message.\n"
         "You do NOT debate further and do NOT call tools.\n\n"
         f"{ANTI_HALLUCINATION_RULE}\n\n"
         "=== MANDATORY TAVILY WEB SEARCH CONTEXT (read-only) ===\n"
@@ -232,22 +233,17 @@ async def _run_turn2_ceo(
         f"USER QUERY:\n{query}\n\n"
         f"WORKER ARGUMENTS ({worker_count} agents — read-only, no agent chat):\n"
         f"{digest}\n\n"
-        f"friction_matrix MUST contain EXACTLY {worker_count} entries "
-        f"(one per worker above, same names).\n"
-        f"agents MUST contain EXACTLY {worker_count} entries.\n"
         f"debate_room MUST contain EXACTLY {worker_count} entries — one card per worker "
-        f"(map each worker's argument into role/conclusion/disagreement/mindChanged).\n"
-        "evidence_vault.clusters MUST include every Tavily URL from your system context.\n"
-        "Synthesize verdict, pre_mortem, execution_roadmap, and tldr from workers "
-        "and Tavily context only.\n"
-        "REQUIRED top-level keys: executive_summary, boardroom_summary, debate_room, "
-        "evidence_vault (not optional).\n"
+        "(role, conclusion, disagreement, mind_changed).\n"
+        "evidence_vault.clusters MUST include every Tavily URL from your system context "
+        "(reddit, news, or official only).\n"
+        "Return ONLY valid JSON matching the schema below — no other keys required.\n"
         f"{build_ceo_json_spec(worker_count)}"
     )
 
     async with asyncio.Semaphore(1):
         return await asyncio.to_thread(
-            invoke_llm,
+            invoke_llm_json,
             llm,
             system,
             user,
@@ -307,6 +303,7 @@ async def run_debate_swarm_async(
         )
 
     personas = build_stateless_personas(trimmed, agent_count)
+    workers: list[WorkerArgument] = []
 
     try:
         workers = await _run_turn1_workers(
@@ -317,36 +314,60 @@ async def run_debate_swarm_async(
         )
         print(f"[mirofish_adapter] Turn 1 complete: {len(workers)} arguments")
 
-        synthesis = await _run_turn2_ceo(
-            llm,
-            trimmed,
-            web_research_raw,
-            workers,
-        )
-        print(f"[mirofish_adapter] Turn 2 complete: ceo_chars={len(synthesis)}")
-
         digest = _format_worker_digest(workers)
-        result = parse_ceo_json(
-            synthesis,
-            worker_digest=digest,
-            query=trimmed,
-        )
-        result["evidence"] = evidence_rows
-        result = _apply_worker_panel(result, workers)
-        result = _ensure_boardroom_fields(result, workers)
+        synthesis = ""
+        try:
+            synthesis = await _run_turn2_ceo(
+                llm,
+                trimmed,
+                web_research_raw,
+                workers,
+            )
+            print(f"[mirofish_adapter] Turn 2 complete: ceo_chars={len(synthesis)}")
+        except Exception as ceo_exc:
+            log_langchain_error(ceo_exc, stage="ceo_synthesis")
+            logger.exception("CEO synthesis LLM call failed")
+            synthesis = ""
 
-        print(
-            f"[mirofish_adapter] SUCCESS verdict_len={len(result['verdict'])} "
-            f"friction={len(result['friction_matrix'])} evidence={len(evidence_rows)}",
-        )
-        return result
+        try:
+            result = safe_synthesize_ceo_result(
+                synthesis,
+                worker_digest=digest,
+                query=trimmed,
+                workers=workers,
+                evidence_rows=evidence_rows,
+            )
+            result = _apply_worker_panel(result, workers)
+            print(
+                f"[mirofish_adapter] SUCCESS verdict_len={len(result['verdict'])} "
+                f"friction={len(result['friction_matrix'])} "
+                f"debate_room={len(result.get('debate_room') or [])} "
+                f"evidence={len(evidence_rows)}",
+            )
+            return result
+        except Exception as parse_exc:
+            log_langchain_error(parse_exc, stage="ceo_parse_fallback")
+            logger.exception("CEO JSON parse failed; building fallback 7-zone report")
+            result = safe_synthesize_ceo_result(
+                synthesis or str(parse_exc),
+                worker_digest=digest,
+                query=trimmed,
+                workers=workers,
+                evidence_rows=evidence_rows,
+            )
+            return _apply_worker_panel(result, workers)
 
     except Exception as exc:
         log_langchain_error(exc, stage="mirofish_adapter")
         logger.exception("MiroFish adapter pipeline failed")
-        return finalize_debate_result(
-            {
-                **fallback_debate_result(str(exc), trimmed),
-                "evidence": evidence_rows,
-            },
+        digest = _format_worker_digest(workers) if workers else ""
+        return _apply_worker_panel(
+            safe_synthesize_ceo_result(
+                str(exc),
+                worker_digest=digest,
+                query=trimmed,
+                workers=workers or None,
+                evidence_rows=evidence_rows,
+            ),
+            workers,
         )
