@@ -369,13 +369,12 @@ def orchestrate_debate(
     model_mix: float = 0,
 ) -> dict[str, str | int | list[dict[str, str]]]:
     """
-    Production debate entrypoint (delegates to services.debate_crew).
-    agent_count is billing metadata only; execution uses 3 agents.
+    Production debate entrypoint (delegates to services.debate_crew / MiroFish adapter).
     """
-    _ = (agent_count, model_mix)
+    _ = model_mix
     from services.debate_crew import run_debate_crew
 
-    result = run_debate_crew(query)
+    result = run_debate_crew(query, agent_count=agent_count)
     return {
         "verdict": result["verdict"],
         "confidence": int(result["confidence"]),
