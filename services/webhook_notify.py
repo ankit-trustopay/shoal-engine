@@ -92,6 +92,10 @@ def notify_debate_completion(
     pre_mortem: dict[str, list[str]] | None = None,
     execution_roadmap: dict[str, str] | None = None,
     evidence: list[dict[str, str]] | None = None,
+    executive_summary: dict[str, str] | None = None,
+    boardroom_summary: dict[str, str] | None = None,
+    debate_room: list[dict[str, str]] | None = None,
+    evidence_vault: dict[str, Any] | None = None,
     runtime: int,
     cost: float,
     agent_count: int,
@@ -142,6 +146,14 @@ def notify_debate_completion(
         body["execution_roadmap"] = execution_roadmap
     if evidence:
         body["evidence"] = evidence
+    if executive_summary:
+        body["executive_summary"] = executive_summary
+    if boardroom_summary:
+        body["boardroom_summary"] = boardroom_summary
+    if debate_room:
+        body["debate_room"] = debate_room
+    if evidence_vault:
+        body["evidence_vault"] = evidence_vault
 
     return _post_webhook(url, _json_safe(body), debate_id, "debate-complete")
 

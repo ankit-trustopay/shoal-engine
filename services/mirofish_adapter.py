@@ -24,6 +24,7 @@ from langchain_openai import ChatOpenAI
 from services.debate_result_codec import (
     ANTI_HALLUCINATION_RULE,
     DebateResult,
+    _ensure_boardroom_fields,
     agents_from_workers,
     build_ceo_json_spec,
     evidence_for_webhook,
@@ -327,6 +328,7 @@ async def run_debate_swarm_async(
         )
         result["evidence"] = evidence_rows
         result = _apply_worker_panel(result, workers)
+        result = _ensure_boardroom_fields(result, workers)
 
         print(
             f"[mirofish_adapter] SUCCESS verdict_len={len(result['verdict'])} "
