@@ -91,6 +91,7 @@ def notify_debate_completion(
     friction_matrix: list[dict[str, str]] | None = None,
     pre_mortem: dict[str, list[str]] | None = None,
     execution_roadmap: dict[str, str] | None = None,
+    evidence: list[dict[str, str]] | None = None,
     runtime: int,
     cost: float,
     agent_count: int,
@@ -139,6 +140,8 @@ def notify_debate_completion(
         body["pre_mortem"] = pre_mortem
     if execution_roadmap:
         body["execution_roadmap"] = execution_roadmap
+    if evidence:
+        body["evidence"] = evidence
 
     return _post_webhook(url, _json_safe(body), debate_id, "debate-complete")
 

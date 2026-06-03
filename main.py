@@ -108,6 +108,7 @@ def _run_debate_crew_and_webhook(
             friction_matrix=list(fallback.get("friction_matrix") or []),
             pre_mortem=fallback.get("pre_mortem"),
             execution_roadmap=fallback.get("execution_roadmap"),
+            evidence=list(fallback.get("evidence") or []),
             runtime=1,
             cost=cost,
             agent_count=max(3, agent_count),

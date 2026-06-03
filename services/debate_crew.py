@@ -16,6 +16,7 @@ from pydantic import ValidationError
 
 from services.debate_constants import AI_MODEL_ERROR_VERDICT
 from services.openrouter_llm import get_default_llm, invoke_llm, log_langchain_error
+from services.scraper import EvidenceItem, scrape_for_premise
 
 logger = logging.getLogger(__name__)
 
@@ -74,10 +75,19 @@ Return ONLY valid JSON (no markdown fences, no commentary) matching this exact s
 
 Rules:
 - stance must be exactly AGREES, DISAGREES, or NEUTRAL (uppercase).
-- pre_mortem.failure_modes: 3-5 concrete failure scenarios grounded in the debate.
+- pre_mortem.failure_modes: 3-5 concrete failure scenarios grounded in the debate and query domain.
 - pre_mortem.critical_unknowns: 3-5 gaps where evidence was insufficient.
-- execution_roadmap must be actionable and specific to this query.
 - tldr must have exactly 3 strings.
+- Match the vocabulary and time horizon of the user's query (history, politics, consumer purchase, science, career, etc.).
+
+CONTEXT — execution_roadmap (CRITICAL):
+- immediate_action and plan_b MUST be highly specific to the user's exact query.
+- If the query is about history or politics: suggest relevant primary sources, archives, historians, or policy documents to consult — not business metrics.
+- If the query is a consumer purchase: suggest checking specific review sites, return policies, or comparison benchmarks — not fundraising or ICPs.
+- If the query is academic or scientific: suggest papers, datasets, or replication checks — not GTM sprints.
+- DO NOT use generic business/SaaS jargon (e.g. "48-hour sprints", "ICP", "CAC", "Series A", "wedge offer")
+  unless the query is explicitly about launching or scaling a B2B startup.
+- Cite concrete next steps a real person could take in the next 48 hours for THIS question.
 """
 
 
@@ -94,6 +104,7 @@ class DebateResult(TypedDict):
     friction_matrix: list[dict[str, str]]
     pre_mortem: dict[str, list[str]]
     execution_roadmap: dict[str, str]
+    evidence: list[dict[str, str]]
 
 
 def ensure_verdict(text: str | None) -> str:
@@ -119,13 +130,25 @@ def _default_pre_mortem() -> dict[str, list[str]]:
     }
 
 
-def _default_execution_roadmap() -> dict[str, str]:
+def _default_execution_roadmap(query: str = "") -> dict[str, str]:
+    trimmed = (query or "").strip()
+    if trimmed:
+        return {
+            "immediate_action": (
+                f"List the three strongest claims about “{trimmed[:80]}” and verify each "
+                "against the live web sources provided in the research block."
+            ),
+            "plan_b": (
+                "If verification fails or sources conflict, narrow the question "
+                "(time period, geography, or scope) and re-run deliberation."
+            ),
+        }
     return {
         "immediate_action": (
-            "Run a 48-hour validation sprint on pricing, channel, and conversion assumptions."
+            "Verify the top three claims in the verdict against the cited live web sources."
         ),
         "plan_b": (
-            "Pivot to a narrower ICP with a lower-CAC wedge offer and pause full launch spend."
+            "If sources conflict, narrow the question and re-run deliberation."
         ),
     }
 
@@ -150,7 +173,42 @@ def _default_friction_matrix() -> list[dict[str, str]]:
     ]
 
 
-def fallback_debate_result(reason: str | None = None) -> DebateResult:
+def _format_evidence_for_prompt(items: list[EvidenceItem]) -> str:
+    if not items:
+        return "No live web sources were retrieved (Tavily unavailable or returned no results)."
+    lines: list[str] = []
+    for index, item in enumerate(items[:10], start=1):
+        title = (item.get("title") or "Untitled").strip()
+        source = (item.get("source") or "Web").strip()
+        url = (item.get("url") or "").strip()
+        snippet = (item.get("snippet") or "").strip()[:400]
+        lines.append(
+            f"{index}. [{source}] {title}\n   URL: {url}\n   Excerpt: {snippet}",
+        )
+    return "\n".join(lines)
+
+
+def _evidence_for_webhook(items: list[EvidenceItem]) -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
+    for item in items:
+        url = (item.get("url") or "").strip()
+        if not url.startswith("http"):
+            continue
+        title = (item.get("title") or "").strip() or url
+        source = (item.get("source") or "").strip() or "Web"
+        snippet = (item.get("snippet") or "").strip() or title[:500]
+        rows.append(
+            {
+                "title": title[:300],
+                "source": source[:120],
+                "url": url[:2000],
+                "snippet": snippet[:1800],
+            },
+        )
+    return rows
+
+
+def fallback_debate_result(reason: str | None = None, query: str = "") -> DebateResult:
     if reason:
         print(f"[debate_crew] FALLBACK reason={reason[:400]}")
     return {
@@ -167,7 +225,8 @@ def fallback_debate_result(reason: str | None = None) -> DebateResult:
         ],
         "friction_matrix": _default_friction_matrix(),
         "pre_mortem": _default_pre_mortem(),
-        "execution_roadmap": _default_execution_roadmap(),
+        "execution_roadmap": _default_execution_roadmap(query),
+        "evidence": [],
     }
 
 
@@ -194,6 +253,7 @@ def finalize_debate_result(result: DebateResult) -> DebateResult:
 
     pre_mortem = result.get("pre_mortem") or _default_pre_mortem()
     execution = result.get("execution_roadmap") or _default_execution_roadmap()
+    evidence = list(result.get("evidence") or [])
 
     return {
         "verdict": verdict,
@@ -203,6 +263,7 @@ def finalize_debate_result(result: DebateResult) -> DebateResult:
         "friction_matrix": friction,
         "pre_mortem": pre_mortem,
         "execution_roadmap": execution,
+        "evidence": evidence,
     }
 
 
@@ -401,7 +462,13 @@ def _build_result(
     return fallback_debate_result("Could not parse CEO JSON")
 
 
-def run_debate_crew(query: str, *, model_mix: float = 0) -> DebateResult:
+def run_debate_crew(
+    query: str,
+    *,
+    model_mix: float = 0,
+    web_context: str | None = None,
+    evidence_items: list[EvidenceItem] | None = None,
+) -> DebateResult:
     """
     Run 3-stage debate via direct OpenRouter ChatOpenAI calls.
     model_mix is accepted for API compatibility but ignored (single model only).
@@ -413,15 +480,26 @@ def run_debate_crew(query: str, *, model_mix: float = 0) -> DebateResult:
     if not trimmed:
         return fallback_debate_result("Missing query")
 
+    if web_context is None or evidence_items is None:
+        print("[debate_crew] running Tavily live web research")
+        web_context, evidence_items = scrape_for_premise(trimmed)
+
+    evidence_rows = _evidence_for_webhook(evidence_items or [])
+    research_block = _format_evidence_for_prompt(evidence_items or [])
+    print(f"[debate_crew] Tavily sources={len(evidence_rows)}")
+
     try:
         llm = get_default_llm()
     except Exception as exc:
         logger.exception("LLM setup failed")
         print(f"[debate_crew] get_default_llm failed: {exc}")
-        return fallback_debate_result(str(exc))
+        return finalize_debate_result(
+            {**fallback_debate_result(str(exc), trimmed), "evidence": evidence_rows},
+        )
 
     system_base = (
         "You are part of Shoal AI's institutional debate desk. "
+        "Ground every claim in the user's question and the live web research provided. "
         "Be specific and concise. Never return an empty response."
     )
 
@@ -430,8 +508,11 @@ def run_debate_crew(query: str, *, model_mix: float = 0) -> DebateResult:
         research = invoke_llm(
             llm,
             system_base,
-            f"Query:\n{trimmed}\n\n"
-            "As Market Researcher, list 5-8 facts, 3 assumptions, 2-3 risks.",
+            f"User query:\n{trimmed}\n\n"
+            f"LIVE WEB RESEARCH (Tavily):\n{research_block}\n\n"
+            f"Research digest:\n{web_context[:6000]}\n\n"
+            "As Market Researcher, cite specific sources by name/URL where possible. "
+            "List 5-8 facts, 3 assumptions, 2-3 risks tied to this exact query.",
             stage="research",
         )
 
@@ -439,8 +520,11 @@ def run_debate_crew(query: str, *, model_mix: float = 0) -> DebateResult:
         debate = invoke_llm(
             llm,
             system_base,
-            f"Query:\n{trimmed}\n\nResearch:\n{research}\n\n"
-            "As Skeptical Debater, challenge 3 claims and list key risks.",
+            f"User query:\n{trimmed}\n\n"
+            f"LIVE WEB RESEARCH:\n{research_block}\n\n"
+            f"Researcher output:\n{research}\n\n"
+            "As Skeptical Debater, challenge 3 claims using the web evidence. "
+            "List key risks specific to this query domain.",
             stage="debate",
         )
 
@@ -448,22 +532,30 @@ def run_debate_crew(query: str, *, model_mix: float = 0) -> DebateResult:
         synthesis = invoke_llm(
             llm,
             system_base,
-            f"Query:\n{trimmed}\n\nResearch:\n{research}\n\nDebate:\n{debate}\n\n"
+            f"User query:\n{trimmed}\n\n"
+            f"LIVE WEB RESEARCH:\n{research_block}\n\n"
+            f"Researcher output:\n{research}\n\n"
+            f"Skeptic output:\n{debate}\n\n"
             "As CEO Synthesizer, produce the final executive decision report.\n"
-            "You MUST include a rigorous pre_mortem and execution_roadmap grounded in the debate above.\n"
+            "pre_mortem and execution_roadmap MUST match the query domain — "
+            "see CONTEXT rules in the schema.\n"
             f"{CEO_JSON_SPEC}",
             stage="synthesis",
         )
 
-        result = _build_result(research, debate, synthesis)
+        result = finalize_debate_result(_build_result(research, debate, synthesis))
+        result["evidence"] = evidence_rows
         print(
             f"[debate_crew] === SUCCESS verdict_len={len(result['verdict'])} "
-            f"confidence={result['confidence']} tldr={len(result['tldr'])} ===",
+            f"confidence={result['confidence']} tldr={len(result['tldr'])} "
+            f"evidence={len(evidence_rows)} ===",
         )
-        return finalize_debate_result(result)
+        return result
 
     except Exception as exc:
         log_langchain_error(exc, stage="debate_pipeline")
         logger.exception("Debate pipeline failed")
         print(f"[debate_crew] pipeline exception: {exc}")
-        return fallback_debate_result(str(exc))
+        return finalize_debate_result(
+            {**fallback_debate_result(str(exc), trimmed), "evidence": evidence_rows},
+        )

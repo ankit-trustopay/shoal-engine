@@ -245,6 +245,7 @@ def run_simple_debate_and_webhook(
         friction_matrix=list(result.get("friction_matrix") or []),
         pre_mortem=result.get("pre_mortem"),
         execution_roadmap=result.get("execution_roadmap"),
+        evidence=list(result.get("evidence") or []),
         runtime=runtime,
         cost=cost,
         agent_count=billed_agents,

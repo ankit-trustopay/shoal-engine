@@ -71,6 +71,8 @@ class PreMortem(BaseModel):
 
 
 class ExecutionRoadmap(BaseModel):
+    """Next steps — must be domain-specific to the user query (not generic SaaS playbooks)."""
+
     immediate_action: str = Field(..., min_length=1)
     plan_b: str = Field(..., min_length=1)
 
