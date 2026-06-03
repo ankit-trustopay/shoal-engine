@@ -140,6 +140,9 @@ def log_langchain_error(exc: Exception, *, stage: str) -> None:
         print(f"[openrouter_llm] LangChain body={str(body)[:800]}")
 
 
+OPENROUTER_MAX_PARALLEL = 50
+
+
 def invoke_llm(llm: ChatOpenAI, system: str, user: str, *, stage: str) -> str:
     try:
         result = llm.invoke(

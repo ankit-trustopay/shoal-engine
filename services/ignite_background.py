@@ -215,7 +215,9 @@ def run_simple_debate_and_webhook(
     started = time.perf_counter()
 
     try:
-        result = finalize_debate_result(run_debate_crew(query))
+        result = finalize_debate_result(
+            run_debate_crew(query, agent_count=agent_count),
+        )
     except Exception as exc:
         logger.exception("Debate crew unexpected failure for %s", debate_id)
         print(f"[ignite_background] debate exception: {exc}")
